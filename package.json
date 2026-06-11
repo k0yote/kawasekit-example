@@ -1,0 +1,29 @@
+{
+  "name": "kawasekit-example",
+  "private": true,
+  "version": "0.0.1",
+  "description": "kawasekit on-ramp — an AI agent paying a metered API in testnet JPYC via the cryptographic 2-of-2 co-signer (mpc-2p). UNAUDITED, testnet only.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev:server": "tsx server/index.ts",
+    "dev:agent": "tsx agent/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "2.0.3",
+    "dotenv": "17.4.2",
+    "hono": "4.12.22",
+    "kawasekit": "link:../kawasekit",
+    "@kawasekit/mpc-2p": "link:../kawasekit-mpc-2p/agent-ts",
+    "viem": "2.50.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.22.3",
+    "typescript": "6.0.3"
+  }
+}
