@@ -8,3 +8,6 @@ dist/
 secrets/
 *.pem
 *.key
+
+# pnpm link writes local sibling paths here — never commit
+pnpm-workspace.yaml

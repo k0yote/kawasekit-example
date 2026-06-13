@@ -62,7 +62,7 @@ result as an integration proof, not a security guarantee.
 ## Prerequisites
 
 1. **A deployed owner backend** — the `cosign_server` from
-   [`kawasekit-mpc-2p`](https://github.com/k0yote/kawasekit-mpc-2p) (see its `docs/DEPLOY-RUNBOOK.md`),
+   [`kawasekit-mpc-2p`](https://github.com/kawasekit/kawasekit-mpc-2p) (see its `docs/DEPLOY-RUNBOOK.md`),
    reachable over **wss + mTLS**, holding the owner share + the spending policy on a persistent
    volume.
 2. **A DKG-provisioned 2-of-2 key** — run the distributed key generation so the **agent** holds
@@ -73,23 +73,40 @@ result as an integration proof, not a security guarantee.
    separate **facilitator EOA** with Amoy MATIC for gas.
 4. **Node ≥ 22** and `pnpm` (or `npm`).
 
-> Local dev wires the two sibling checkouts via `link:` (`kawasekit` and
-> `kawasekit-mpc-2p/agent-ts`). In your own project you depend on `kawasekit` from npm + the
-> private `@kawasekit/mpc-2p` client you received with your co-signer.
+## Packages & install
 
-## Run it
+This repo depends on the two published packages — the open-core seam in your own `package.json`:
+
+- **`kawasekit`** (public, npm) — the x402 client/server + the `createMpc2pPolicyGatedSigner`
+  adapter. Installs for anyone.
+- **`@kawasekit/mpc-2p`** (private, GitHub Packages) — the injected glue (WASM share + transport +
+  A3). It's an **`optionalDependency`**: the metered-API **server installs and runs for anyone**;
+  only the **paying agent** needs this private client, which ships with your owner-hosted co-signer.
+
+The committed [`.npmrc`](.npmrc) routes the `@kawasekit` scope to GitHub Packages. A token-less
+install is clean — the optional private client is simply excluded and the server still runs. To
+install the private client, authenticate once with a GitHub token that has `read:packages` (+
+access to the kawasekit org packages):
 
 ```sh
-cp .env.example .env      # fill in the facilitator key, recipient, and the co-signer config
-pnpm install
-pnpm typecheck            # optional — verifies the wiring against the SDK types
+npm config set //npm.pkg.github.com/:_authToken "$GITHUB_TOKEN"   # read:packages — for the agent
 
-# terminal 1 — the metered API
+cp .env.example .env             # fill in the facilitator key, recipient, and the co-signer config
+pnpm install                     # no token → server-only (the optional client is excluded)
+pnpm typecheck                   # optional — verifies the wiring against the SDK types
+
+# terminal 1 — the metered API  (no token needed)
 pnpm dev:server
 
-# terminal 2 — the paying agent (pays via the cryptographic co-signer)
+# terminal 2 — the paying agent (needs @kawasekit/mpc-2p installed)
 pnpm dev:agent
 ```
+
+> **Local dev against sibling checkouts.** Working on `kawasekit` / `kawasekit-mpc-2p` themselves?
+> Override the published deps without touching `package.json`:
+> `pnpm link ../kawasekit && pnpm link ../kawasekit-mpc-2p/agent-ts`
+> (build the siblings first: `pnpm -C ../kawasekit build` and
+> `pnpm -C ../kawasekit-mpc-2p/agent-ts build`). `pnpm unlink` to revert.
 
 Expected: the agent prints the weather for the city plus a Polygon Amoy settlement tx hash. The
 co-signer enforces the owner's policy on every payment — an over-policy request comes back as a
