@@ -54,7 +54,7 @@ const paymentSigner = createX402PaymentSigner({
 
 // A defence-in-depth budget guard on the wrapping fetch (on top of the owner's
 // authoritative on-chain cap): refuse to pay beyond a session ceiling.
-const MAX_SPEND = BigInt(optionalEnv("MAX_SPEND_BASE_UNITS") ?? "1000000"); // 1 JPYC (6 decimals)
+const MAX_SPEND = BigInt(optionalEnv("MAX_SPEND_BASE_UNITS") ?? "10000000000000000"); // 0.01 JPYC (18 decimals)
 let spent = 0n;
 
 const fetch402 = wrapFetch({
