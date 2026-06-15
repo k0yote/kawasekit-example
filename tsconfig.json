@@ -15,5 +15,5 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["server", "agent", "lib"]
+  "include": ["server", "agent", "lib", "zerodev-agent-jpyc"]
 }

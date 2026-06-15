@@ -2,7 +2,7 @@
   "name": "kawasekit-example",
   "private": true,
   "version": "0.0.1",
-  "description": "kawasekit on-ramp — an AI agent paying a metered API in testnet JPYC via the cryptographic 2-of-2 co-signer (mpc-2p). UNAUDITED, testnet only.",
+  "description": "kawasekit on-ramp examples — (1) an AI agent paying a metered API in testnet JPYC via the cryptographic 2-of-2 co-signer (mpc-2p); (2) RFC-0001 ZeroDev session-key e2e JPYC payment on Amoy. UNAUDITED, testnet only.",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
@@ -11,13 +11,18 @@
   "scripts": {
     "dev:server": "tsx server/index.ts",
     "dev:agent": "tsx agent/index.ts",
+    "zerodev:demo": "tsx zerodev-agent-jpyc/run-demo.ts",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@hono/node-server": "2.0.3",
+    "@zerodev/ecdsa-validator": "5.4.9",
+    "@zerodev/permissions": "5.5.14",
+    "@zerodev/sdk": "5.5.10",
     "dotenv": "17.4.2",
     "hono": "4.12.22",
-    "kawasekit": "^0.5.0",
+    "kawasekit": "^0.7.0",
     "viem": "2.50.4"
   },
   "optionalDependencies": {
@@ -26,6 +31,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.22.3",
-    "typescript": "6.0.3"
+    "typescript": "6.0.3",
+    "vitest": "^4.1.7"
   }
 }
