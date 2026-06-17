@@ -17,11 +17,19 @@ boundary test — see "SDK boundary findings" below).
    Do **not** trust a search-derived address. The harness asserts on-chain
    `decimals()` matches and that the address equals kawasekit's built-in
    `getJpycAddress(80002)` at startup, and aborts on mismatch.
-2. **Fund the smart account** with testnet JPYC (JPYC Amoy faucet). The agent
-   holds **0 POL** (gas is sponsored) — that is the H2 acceptance.
-3. **Set a ZeroDev gas policy on the Amoy project BEFORE running**, covering the
-   demo userOps. Without it the paymaster declines and the harness throws a
-   `SponsorshipError` (there is **no** owner-pays-gas fallback, by design).
+2. **Fund the smart account** with testnet JPYC (JPYC Amoy faucet). The address to
+   fund is the **counterfactual Kernel account** (derived from the owner sudo
+   validator — *not* either EOA); run the **preflight** (it's the head of
+   `pnpm zerodev:demo`, or call `preflight()` directly) to print that exact address,
+   its current JPYC balance, and whether it's deployed yet. The agent holds **0 POL**
+   (gas is sponsored) — that is the H2 acceptance; do **not** fund POL to it.
+3. **Set a blanket "sponsor-all" ZeroDev gas policy on the Amoy project BEFORE
+   running**, covering the demo userOps. Without it the paymaster declines and the
+   harness throws a `SponsorshipError` (there is **no** owner-pays-gas fallback, by
+   design). The gas policy MUST NOT restrict recipient/amount: the §8 negatives
+   (N1–N4) prove the *permission validator* is the boundary, so a gas policy that
+   itself filtered recipient/amount would reject at the paymaster instead and mask
+   the validator (the harness fails such a run — see "Acceptance").
 4. **ZeroDev project**: bundler + paymaster RPC (`ZERODEV_RPC`) and
    `ZERODEV_PROJECT_ID` from the dashboard (Amoy project).
 5. **Keys** (`OWNER_PRIVATE_KEY`, `SESSION_PRIVATE_KEY`): testnet-only, never
@@ -34,54 +42,88 @@ Copy the vars from [`./.env.example`](./.env.example) into the repo-root `.env`
 
 ```sh
 pnpm install          # installs kawasekit@0.7.0 + aligned @zerodev/* + vitest
-pnpm zerodev:demo     # H1 happy path (needs the funded env + gas policy above)
-pnpm test             # unit cases always; H1/H2/N1–N4/I1/I2 run only when the live env is set
+pnpm zerodev:demo     # preflight (prints the account to fund) then the H1 happy path
+pnpm test:rfc0001     # this harness only — unit always; integration runs when the live env is set
+pnpm typecheck:rfc0001 # typecheck this harness only (independent of the rest of the repo)
 ```
 
-`pnpm test` runs the §8 suite: 3 **unit** cases always (idempotency-key
-determinism, observability emit, buy-list mapping), and 7 **integration** cases
-that auto-skip unless the full live env is present.
+`pnpm test:rfc0001` runs the §8 suite: **unit** cases always (idempotency-key
+determinism, observability emit + the sponsor/validation reject routing, buy-list
+mapping), and **integration** cases (H1/H2/N1–N4/I1/I2 + preflight) that auto-skip
+unless the full live env is present.
+
+> **Independent gate (RFC §11).** `test:rfc0001` and `typecheck:rfc0001` (the latter
+> via a dedicated [`./tsconfig.json`](./tsconfig.json)) exercise *only* this harness,
+> so they stay green **without** the private `@kawasekit/mpc-2p` optional dep that the
+> repo's other examples (`../lib`, `../server`, `../agent`) need. The repo-wide
+> `pnpm typecheck` / `pnpm test` require that dep installed (GitHub Packages auth).
 
 ## Acceptance (RFC-0001 §8)
 
-A passing live run = **H1+H2 succeed** AND **N1–N4 each revert at userOp
-validation** (asserted by the merchant `balanceOf` being unchanged — the
-discriminator from a token-balance failure), on Amoy, with sponsored gas.
-**I1** = a replay of the same `{conversationId, stepId}` returns the cached
-result without a second submission. **I2** = submit/sponsor/settle spans emit.
+> **⛒ Premise gate (F1) — unit green ≠ de-risk closed.** The discriminator below
+> is only sound if ZeroDev's verifying paymaster, under the blanket "sponsor-all"
+> policy, **sponsors** an out-of-allowlist op (so the *validator* rejects it) rather
+> than **simulate-and-declining** it at `pm_sponsorUserOperation`. So the FIRST thing
+> the live Amoy run must establish is: a live **N1** (out-of-allowlist) throws a
+> **non-`SponsorshipError`** with **no `sponsor_reject`** span. The test logs which
+> branch each negative took (`[F1 premise] …`). If N1 instead returns
+> `SponsorshipError`/`sponsor_reject`, **STOP** — apply the RFC-0001 §9 fallback (run
+> N1–N4 without the paymaster on a deployed, POL-funded account). Until confirmed
+> on-chain, step 3 is **implemented, not de-risked**.
+
+A passing live run = **the premise gate holds** AND **H1+H2 succeed** AND **N1–N4 are
+each rejected by the on-chain permission validator**, on Amoy, with sponsored gas. The
+de-risk is that the *policy*, not the paymaster or token balance, is the boundary, so
+each negative asserts: the throw is **not** a `SponsorshipError` (the paymaster did not
+decline), the span stream carries **no** `sponsor_reject` and **no** `settle`, and the
+merchant `balanceOf` is **unchanged**. (A bare "it threw" would also pass for a paymaster
+decline — which is exactly what this discriminates against; see
+`expectPolicyValidationReject` in `harness.test.ts`.)
+
+**I1** = a replay of the same `{conversationId, stepId}` returns the cached result
+without a second submission — **call-level, in-process dedup only** (the cache is
+an in-memory `Map`; it is lost on restart and keyed on harness-local ids that
+diverge across agent-harness boundaries). The real over-spend backstop is the
+on-chain rateLimit count, not this cache. Durable / protocol-normalized-intent
+idempotency is future work. **I2** = submit/sponsor/settle spans emit.
 
 ## SDK public-API boundary findings (RFC §6.4 canary)
 
-What `kawasekit@0.7.0` covered (used as-is, no internals): `createBuyListPolicies`;
-`issueSessionKey` + `serializeSessionEnvelope` (owner; wraps ZeroDev's
-`serializePermissionAccount` + `addressToEmptyAccount` — the owner never signs
-with the session key); `parseSessionEnvelope` + `restoreSessionAccount` (agent,
-real signer); `transferJpyc(client, …)`; `jpycAbi` / `getJpycAddress` /
+What kawasekit covered (used as-is, no internals): `createBuyListPolicies`;
+**`createSponsoredKernelClient`** (the 0.8.0 helper — builds the gas-sponsored
+client; see G1/G4 closed); `issueSessionKey` + `serializeSessionEnvelope` (owner;
+wraps ZeroDev's `serializePermissionAccount`, building the permission account with
+the **real** session signer — see G2); `parseSessionEnvelope` + `restoreSessionAccount`
+(agent, real signer); `transferJpyc(client, …)`; `jpycAbi` / `getJpycAddress` /
 `JPYC_DECIMALS` / `polygonAmoy`; `deriveIdempotencyKey`; `invokeHookSafely`.
 
-Where the harness had to drop to the **raw `@zerodev/sdk`** (gaps):
+SDK gaps surfaced by this boundary test (**G1 + G4 now CLOSED** by `createSponsoredKernelClient`):
 
-- **G1 — sponsored kernel-account client construction.** kawasekit exports the
-  `ConfiguredKernelClient` *type* and `transferJpyc(client, …)` that *consumes*
-  one, but **no helper to BUILD it** with a bundler + ZeroDev paymaster. So
-  `harness.ts` uses raw `createKernelAccountClient` + `createZeroDevPaymasterClient`
-  for the entire sponsor-gas wiring (D6/O6). This is the main gap: the SDK can
-  *spend* through a sponsored client but cannot *construct* one. A `kawasekit`
-  helper (e.g. `createSponsoredKernelClient({ account, bundlerRpc, paymasterRpc })`)
-  would close it.
-- **G2 — `issueSessionKey` requires a full session `LocalAccount`** (it only uses
-  `.address` internally via `addressToEmptyAccount`). The clean "agent generates
-  the key, owner only ever sees the address" split isn't directly expressible;
-  an address-only issuance variant would help. (Harmless for this single-operator
-  demo.)
+- **G1 — sponsored kernel-account client construction — CLOSED.** kawasekit now
+  ships `createSponsoredKernelClient({ account, chain, zerodevRpc, publicClient?, observability? })`;
+  `harness.ts` uses it and **no longer touches raw `@zerodev/sdk`** for client
+  construction. The optional `observability` hook (`onSponsor` / `onSponsorError`)
+  carries the §8 `sponsor` / `sponsor_reject` discrimination; the harness re-raises
+  a typed `SponsorshipError` on a genuine decline (no owner-pays fallback).
+- **G2 — `issueSessionKey` requires a full session `LocalAccount`** (its private
+  key), because internally it builds the permission account with the **real**
+  session signer (`toECDSASigner`) rather than `addressToEmptyAccount` (which is
+  used nowhere in kawasekit). So the issuer must hold the session secret at
+  issuance time, and the clean "agent generates the key, owner only ever sees the
+  address" split is **not** directly expressible. An address-only issuance variant
+  (built on `addressToEmptyAccount` + `serializePermissionAccount`) would close it
+  and is relevant to the Hub L1 design (RFC §10). Harmless for this single-operator
+  demo, where both keys are co-located.
 - **G3 — observability events are x402-facilitator-shaped** (`SettleEvent`,
-  `VerifyEvent`, payment-required/accepted). The Option-A userOp path has
-  `submit`/`sponsor` phases with no native SDK event, so the harness defines its
-  own phase events and fires them via the SDK's generic `invokeHookSafely`. A
-  userOp-native observability surface would close it.
-- **G4 (type-only) — `createKernelAccountClient`'s deep generics don't unify with
-  the exported `ConfiguredKernelClient` alias**, so one documented
-  `as unknown as ConfiguredKernelClient` is needed (same runtime client).
+  `VerifyEvent`, payment-required/accepted) — **partially closed.** The
+  **sponsorship** seam now has a native hook (`createSponsoredKernelClient`'s
+  `observability.onSponsor` / `onSponsorError`); the `submit` / `settle` phases are
+  still harness-defined and fired via the SDK's generic `invokeHookSafely`. A
+  userOp-native observability surface for those would close the remainder.
+- **G4 (type-only) — CLOSED.** `createSponsoredKernelClient` returns a typed
+  `ConfiguredKernelClient`; the harness's `buildSponsoredKernelClient` no longer
+  needs the `as unknown as ConfiguredKernelClient` cast or an `any`-typed account
+  (the single documented cast now lives once, inside the SDK helper).
 
 Minor: `transferJpyc` resolves the JPYC address from kawasekit's built-in
 deployments, not a caller argument — so `JPYC_ADDRESS_AMOY` is a *verification

@@ -27,8 +27,8 @@ importers:
         specifier: 4.12.22
         version: 4.12.22
       kawasekit:
-        specifier: ^0.7.0
-        version: 0.7.0(@zerodev/webauthn-key@5.5.0(viem@2.50.4(typescript@6.0.3)))(hono@4.12.22)(typescript@6.0.3)
+        specifier: ^0.8.0
+        version: 0.8.0(@zerodev/webauthn-key@5.5.0(viem@2.50.4(typescript@6.0.3)))(hono@4.12.22)(typescript@6.0.3)
       viem:
         specifier: 2.50.4
         version: 2.50.4(typescript@6.0.3)
@@ -568,8 +568,8 @@ packages:
     peerDependencies:
       ws: '*'
 
-  kawasekit@0.7.0:
-    resolution: {integrity: sha512-ccAOcqNjPRf6p89odvwUDmYe+dRdCBLkOIdeSYFC8EBMGTowH8+SFXvP3oTYNaW+kWxFx5RIcvVDYzoPmPxjBw==}
+  kawasekit@0.8.0:
+    resolution: {integrity: sha512-d9D+fGUZZiNjP52zS3Pj2p2Wj0aTNeXklvv5AkqYBsPsMGPsE1k04YGZYUmskU69yFP0mdepZ+00h61Y9WJ/4A==}
     engines: {node: '>=22'}
     hasBin: true
     peerDependencies:
@@ -1295,7 +1295,7 @@ snapshots:
     dependencies:
       ws: 8.20.1
 
-  kawasekit@0.7.0(@zerodev/webauthn-key@5.5.0(viem@2.50.4(typescript@6.0.3)))(hono@4.12.22)(typescript@6.0.3):
+  kawasekit@0.8.0(@zerodev/webauthn-key@5.5.0(viem@2.50.4(typescript@6.0.3)))(hono@4.12.22)(typescript@6.0.3):
     dependencies:
       '@zerodev/ecdsa-validator': 5.4.9(@zerodev/sdk@5.5.10(viem@2.50.4(typescript@6.0.3)))(viem@2.50.4(typescript@6.0.3))
       '@zerodev/permissions': 5.5.14(@zerodev/sdk@5.5.10(viem@2.50.4(typescript@6.0.3)))(@zerodev/webauthn-key@5.5.0(viem@2.50.4(typescript@6.0.3)))(viem@2.50.4(typescript@6.0.3))

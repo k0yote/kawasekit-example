@@ -1,0 +1,8 @@
+{
+  // Independent RFC-0001 gate: typechecks ONLY the zerodev-agent-jpyc harness, so
+  // it stays green even when the private `@kawasekit/mpc-2p` example dep (used by
+  // ../lib, ../server, ../agent) is not installed. Inherits the repo compiler
+  // options; `include` is scoped to this dir. Run: `tsc --noEmit -p` this file.
+  "extends": "../tsconfig.json",
+  "include": ["."]
+}
