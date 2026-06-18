@@ -10,7 +10,7 @@
  * See README "SDK boundary findings".
  */
 
-import type { CreateKernelAccountReturnType } from "@zerodev/sdk";
+import { type CreateKernelAccountReturnType, createKernelAccountClient } from "@zerodev/sdk";
 import {
 	type ConfiguredKernelClient,
 	createBuyListPolicies,
@@ -28,6 +28,7 @@ import {
 	type Address,
 	type Chain,
 	formatUnits,
+	http,
 	type LocalAccount,
 	parseUnits,
 	type PublicClient,
@@ -103,16 +104,27 @@ export async function issueScopedSessionKey(params: {
 	return serializeSessionEnvelope(envelope);
 }
 
+/** Floor POL the smart account needs for the §9 paymaster-less negatives' prefund check. */
+export const SELF_PAID_POL_FLOOR = parseUnits("0.05", 18);
+
 /** What {@link preflight} reports back to the caller. */
 export interface PreflightResult {
 	/** The counterfactual Kernel address that holds JPYC and pays — FUND THIS. */
 	readonly accountAddress: Address;
 	/** Current on-chain JPYC balance of that account (raw units). */
 	readonly jpycBalance: bigint;
+	/** Current native POL balance (raw wei). Only the §9 self-paid negatives need it. */
+	readonly polBalance: bigint;
 	/** Whether the account bytecode is already on-chain (else the 1st userOp deploys it). */
 	readonly deployed: boolean;
 	/** True if the balance covers at least the H1 happy-path payment. */
 	readonly sufficientForHappyPath: boolean;
+	/**
+	 * True if POL covers the §9 paymaster-less negatives' bundler prefund check
+	 * ({@link SELF_PAID_POL_FLOOR}). The POL is NOT consumed — those ops revert at
+	 * validation. H1/H2 stay sponsored and need no POL.
+	 */
+	readonly sufficientPolForSelfPaid: boolean;
 }
 
 /**
@@ -144,7 +156,7 @@ export async function preflight(params: {
 	});
 	const accountAddress = parseSessionEnvelope(serialized).smartAccountAddress;
 
-	const [jpycBalance, code] = await Promise.all([
+	const [jpycBalance, code, polBalance] = await Promise.all([
 		publicClient.readContract({
 			address: cfg.jpycAddress,
 			abi: jpycAbi,
@@ -152,10 +164,12 @@ export async function preflight(params: {
 			args: [accountAddress],
 		}) as Promise<bigint>,
 		publicClient.getCode({ address: accountAddress }),
+		publicClient.getBalance({ address: accountAddress }),
 	]);
 	const deployed = code !== undefined && code !== "0x";
 	const happyPathFloor = parseUnits("0.001", cfg.jpycDecimals);
 	const sufficientForHappyPath = jpycBalance >= happyPathFloor;
+	const sufficientPolForSelfPaid = polBalance >= SELF_PAID_POL_FLOOR;
 
 	log("── RFC-0001 preflight ─────────────────────────────────────────");
 	log(`  smart account (FUND THIS) : ${accountAddress}`);
@@ -166,17 +180,29 @@ export async function preflight(params: {
 		}`,
 	);
 	if (sufficientForHappyPath) {
-		log("  funding                   : ✅ enough for the H1 happy path");
+		log("  JPYC funding              : ✅ enough for the H1 happy path");
 	} else {
 		log(
-			`  funding                   : ⚠️  below ${formatUnits(happyPathFloor, cfg.jpycDecimals)} JPYC — send JPYC to the address above`,
+			`  JPYC funding              : ⚠️  below ${formatUnits(happyPathFloor, cfg.jpycDecimals)} JPYC — send JPYC to the address above`,
 		);
 		log("                              from the JPYC Amoy faucet (recommend ≥ 1 JPYC for the full §8 suite).");
 	}
-	log("  gas (POL)                 : sponsored by the paymaster — do NOT fund POL to this account.");
+	// POL: the SPONSORED path (H1/H2/I1/I2) needs none. The §9 paymaster-LESS negatives
+	// (N1–N4 self-paid) need POL so the bundler's prefund check passes — it is NOT
+	// consumed (they revert at validation).
+	log(`  POL balance               : ${formatUnits(polBalance, 18)} POL`);
+	if (sufficientPolForSelfPaid) {
+		log("  POL (§9 self-paid negs)   : ✅ enough for the paymaster-less prefund check (not consumed)");
+	} else {
+		log(
+			`  POL (§9 self-paid negs)   : ⚠️  below ${formatUnits(SELF_PAID_POL_FLOOR, 18)} POL — fund ~0.1 POL from the Amoy POL faucet`,
+		);
+		log("                              (https://faucet.polygon.technology/). NOT consumed — the negatives revert at validation.");
+		log("                              The SPONSORED happy path (H1/H2) needs no POL.");
+	}
 	log("───────────────────────────────────────────────────────────────");
 
-	return { accountAddress, jpycBalance, deployed, sufficientForHappyPath };
+	return { accountAddress, jpycBalance, polBalance, deployed, sufficientForHappyPath, sufficientPolForSelfPaid };
 }
 
 /**
@@ -213,6 +239,30 @@ export function buildSponsoredKernelClient(params: {
 	});
 }
 
+/**
+ * §9 FALLBACK (Amoy run #1) — build a Kernel client WITHOUT a paymaster: the
+ * account pays its own gas (POL). Used ONLY by the paymaster-less N1–N4 so the
+ * on-chain permission validator is the **sole** rejecter — there is no verifying
+ * paymaster to simulate-and-decline (the run-#1 finding) and conflate the signal.
+ * No `sponsor`/`sponsor_reject` here; a rejection surfaces as the raw on-chain
+ * validation error → `validation_reject`. Deliberately raw `@zerodev/sdk` (the
+ * sponsored path keeps using `createSponsoredKernelClient`, untouched).
+ */
+export function buildSelfPaidKernelClient(params: {
+	readonly account: CreateKernelAccountReturnType<"0.7">;
+	readonly cfg: RfcConfig;
+}): ConfiguredKernelClient {
+	const { cfg, account } = params;
+	const client = createKernelAccountClient({
+		account,
+		chain: cfg.chain,
+		bundlerTransport: http(cfg.zerodevRpc),
+		// no `paymaster` middleware → the account self-pays gas from its POL balance.
+	});
+	// Same deep-generic non-unify as createSponsoredKernelClient — one documented cast.
+	return client as unknown as ConfiguredKernelClient;
+}
+
 export interface AgentPayIdentity {
 	readonly conversationId: string;
 	readonly stepId: string;
@@ -226,10 +276,14 @@ export interface AgentPayResult {
 
 /**
  * AGENT side — deserialize the approval with the REAL session signer, build the
- * sponsored client, and send `JPYC.transfer(to, amount)`. Idempotent: a replay
- * with the same `{conversationId, stepId}` returns the cached result without a
- * second submission (RFC §6.2 step 7 / acceptance I1). Validation reverts (N1–N4)
- * propagate after a `validation_reject` span — the userOp never executes.
+ * client, and send `JPYC.transfer(to, amount)`. Idempotent: a replay with the same
+ * `{conversationId, stepId}` returns the cached result without a second submission
+ * (RFC §6.2 step 7 / acceptance I1).
+ *
+ * `selfPaid` (default false) selects the path: SPONSORED (paymaster) vs the §9
+ * paymaster-LESS path (the account self-pays gas). On the self-paid path there is
+ * no paymaster, so a policy rejection surfaces as the raw on-chain validation error
+ * → a `validation_reject` span (no `sponsor`/`sponsor_reject`, no `SponsorshipError`).
  */
 export async function agentPay(params: {
 	readonly cfg: RfcConfig;
@@ -241,6 +295,8 @@ export async function agentPay(params: {
 	readonly identity: AgentPayIdentity;
 	readonly cache: Map<string, TransferJpycResult>;
 	readonly telemetry?: HarnessTelemetry;
+	/** §9 fallback: pay gas from the account's own POL (no paymaster). Default false. */
+	readonly selfPaid?: boolean;
 }): Promise<AgentPayResult> {
 	const { cfg, identity, cache, telemetry } = params;
 	// kawasekit-derived idempotency key for "the same logical payment step".
@@ -256,17 +312,21 @@ export async function agentPay(params: {
 		envelope,
 		sessionKeySigner: params.sessionSigner,
 	});
-	// Latest-wins (F4): reflects the LAST sponsor outcome, robust to getPaymasterData
-	// firing more than once per send. A genuine final decline → SponsorshipError below.
+	// SPONSORED (default) vs SELF-PAID (§9 fallback). Latest-wins (F4): sponsorDeclined
+	// reflects the LAST sponsor outcome, robust to getPaymasterData firing more than once.
+	// On the self-paid path there is no paymaster → sponsorDeclined stays false → a
+	// rejection emits `validation_reject` below (the on-chain validator is the sole rejecter).
 	let sponsorDeclined = false;
-	const client = buildSponsoredKernelClient({
-		account,
-		cfg,
-		telemetry,
-		onSponsorOutcome: (declined) => {
-			sponsorDeclined = declined;
-		},
-	});
+	const client = params.selfPaid
+		? buildSelfPaidKernelClient({ account, cfg })
+		: buildSponsoredKernelClient({
+				account,
+				cfg,
+				telemetry,
+				onSponsorOutcome: (declined) => {
+					sponsorDeclined = declined;
+				},
+			});
 
 	emit(telemetry, {
 		phase: "submit",
