@@ -11,3 +11,6 @@ secrets/
 
 # pnpm link writes local sibling paths here — never commit
 pnpm-workspace.yaml
+
+# RFC-0003 Cycle 1 — persisted software passkey (testnet only, never commit)
+zerodev-passkey-jpyc/.passkey-cycle1.json
