@@ -12,19 +12,26 @@
     "dev:server": "tsx server/index.ts",
     "dev:agent": "tsx agent/index.ts",
     "zerodev:demo": "tsx zerodev-agent-jpyc/run-demo.ts",
+    "zerodev:passkey:demo": "tsx zerodev-passkey-jpyc/run-demo.ts",
     "test": "vitest run",
     "test:rfc0001": "vitest run zerodev-agent-jpyc",
+    "test:rfc0003": "vitest run zerodev-passkey-jpyc",
+    "passkey:p1": "tsx zerodev-passkey-jpyc/probe-passkey.ts",
     "typecheck": "tsc --noEmit",
-    "typecheck:rfc0001": "tsc --noEmit -p zerodev-agent-jpyc/tsconfig.json"
+    "typecheck:rfc0001": "tsc --noEmit -p zerodev-agent-jpyc/tsconfig.json",
+    "typecheck:rfc0003": "tsc --noEmit -p zerodev-passkey-jpyc/tsconfig.json"
   },
   "dependencies": {
     "@hono/node-server": "2.0.3",
     "@zerodev/ecdsa-validator": "5.4.9",
+    "@zerodev/passkey-validator": "^5.6.0",
     "@zerodev/permissions": "5.5.14",
     "@zerodev/sdk": "5.5.10",
+    "@zerodev/webauthn-key": "^5.5.0",
     "dotenv": "17.4.2",
     "hono": "4.12.22",
     "kawasekit": "^0.8.0",
+    "ox": "^0.14.29",
     "viem": "2.50.4"
   },
   "optionalDependencies": {
