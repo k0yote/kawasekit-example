@@ -17,12 +17,15 @@ boundary test — see "SDK boundary findings" below).
    Do **not** trust a search-derived address. The harness asserts on-chain
    `decimals()` matches and that the address equals kawasekit's built-in
    `getJpycAddress(80002)` at startup, and aborts on mismatch.
-2. **Fund the smart account** with testnet JPYC (JPYC Amoy faucet). The address to
-   fund is the **counterfactual Kernel account** (derived from the owner sudo
-   validator — *not* either EOA); run the **preflight** (it's the head of
-   `pnpm zerodev:demo`, or call `preflight()` directly) to print that exact address,
-   its current JPYC balance, and whether it's deployed yet. The agent holds **0 POL**
-   (gas is sponsored) — that is the H2 acceptance; do **not** fund POL to it.
+2. **Fund the smart account** — the **counterfactual Kernel account** (derived from
+   the owner sudo validator, *not* either EOA); run the **preflight** (head of
+   `pnpm zerodev:demo`, or call `preflight()`) to print that exact address + its JPYC
+   and POL balances:
+   - **JPYC** (Amoy faucet) — ≥ 1 JPYC for the full §8 suite.
+   - **~0.1 POL** (Amoy POL faucet, https://faucet.polygon.technology/) — **only** for
+     the §8(a) **paymaster-less** N1–N4 (the bundler prefund check); it is **NOT
+     consumed** (those ops revert at validation). The **sponsored** path (H1/H2/I1/I2
+     + sponsored N1–N4) needs **0 POL** — that is the H2 acceptance.
 3. **Set a blanket "sponsor-all" ZeroDev gas policy on the Amoy project BEFORE
    running**, covering the demo userOps. Without it the paymaster declines and the
    harness throws a `SponsorshipError` (there is **no** owner-pays-gas fallback, by
@@ -60,25 +63,28 @@ unless the full live env is present.
 
 ## Acceptance (RFC-0001 §8)
 
-> **⛒ Premise gate (F1) — unit green ≠ de-risk closed.** The discriminator below
-> is only sound if ZeroDev's verifying paymaster, under the blanket "sponsor-all"
-> policy, **sponsors** an out-of-allowlist op (so the *validator* rejects it) rather
-> than **simulate-and-declining** it at `pm_sponsorUserOperation`. So the FIRST thing
-> the live Amoy run must establish is: a live **N1** (out-of-allowlist) throws a
-> **non-`SponsorshipError`** with **no `sponsor_reject`** span. The test logs which
-> branch each negative took (`[F1 premise] …`). If N1 instead returns
-> `SponsorshipError`/`sponsor_reject`, **STOP** — apply the RFC-0001 §9 fallback (run
-> N1–N4 without the paymaster on a deployed, POL-funded account). Until confirmed
-> on-chain, step 3 is **implemented, not de-risked**.
+> **F1 premise — RESOLVED by Amoy run #1 (2026-06-18); acceptance is now "Both".**
+> See `docs/rfc/rfc0001-amoy-run1-evaluation.md`. With ZeroDev's verifying paymaster,
+> revert-style policies (Call/RateLimit → N1–N3) surface as `sponsor_reject` (the
+> paymaster fail-fasts on a reverting `validateUserOp`); the non-reverting Timestamp
+> (N4) is sponsored then bundler-rejected → `validation_reject`. **Enforcement held —
+> no funds moved in any negative.** `unit green ≠ de-risk closed`.
 
-A passing live run = **the premise gate holds** AND **H1+H2 succeed** AND **N1–N4 are
-each rejected by the on-chain permission validator**, on Amoy, with sponsored gas. The
-de-risk is that the *policy*, not the paymaster or token balance, is the boundary, so
-each negative asserts: the throw is **not** a `SponsorshipError` (the paymaster did not
-decline), the span stream carries **no** `sponsor_reject` and **no** `settle`, and the
-merchant `balanceOf` is **unchanged**. (A bare "it threw" would also pass for a paymaster
-decline — which is exactly what this discriminates against; see
-`expectPolicyValidationReject` in `harness.test.ts`.)
+A passing live run = **H1+H2 succeed** AND **BOTH**:
+- **(a) paymaster-LESS N1–N4 → all `validation_reject`** (`expectOnChainValidationReject`)
+  — self-paid (POL) so the **on-chain validator is the SOLE rejecter** (no paymaster to
+  conflate): threw (not `SponsorshipError`), a `validation_reject` span, no `sponsor_reject`,
+  no `settle`, merchant balance unchanged. The immutable, paymaster-independent proof. Needs
+  ~0.1 POL on the account for the bundler prefund check (NOT consumed — they revert at
+  validation); H1/H2 stay sponsored and need no POL.
+- **(b) sponsored N1–N4 → the durable invariant** (`expectPolicyEnforced`) — the production
+  path: threw + **no `settle`** + merchant `balanceOf` unchanged, with the branch
+  (`sponsor_reject`/`validation_reject`) **recorded** via `[F1 premise] …` but **not**
+  hard-asserted (so the test survives ZeroDev paymaster-behavior changes). Controlled
+  comparison (H1 in-scope settles vs N1–N3 one-param-out-of-scope rejected) attributes the
+  rejection to the policy. Requires a blanket "sponsor-all" gas policy.
+
+Both green on Amoy = step 3 de-risked. **Amoy 2026-06-18: 16/16 PASS ✅** — H1/H2 ✅; (b) ✅ (N1–N3 `sponsor_reject`, N4 `validation_reject`); (a) ✅ (all `validation_reject`). **Step 3 DE-RISKED** — no funds moved in any negative.
 
 **I1** = a replay of the same `{conversationId, stepId}` returns the cached result
 without a second submission — **call-level, in-process dedup only** (the cache is

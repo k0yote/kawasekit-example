@@ -116,23 +116,21 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 	const freshCache = (): Map<string, TransferJpycResult> => new Map();
 
 	/**
-	 * Assert a payment was rejected by the on-chain PERMISSION VALIDATOR — NOT by
-	 * the paymaster. This is the real §8 G3 discriminator: a bare
-	 * `rejects.toThrow()` would also pass for a paymaster sponsorship decline,
-	 * masking whether `createBuyListPolicies` is actually the boundary.
-	 *
-	 * The throw must NOT be a `SponsorshipError` and the span stream must carry
-	 * NO `sponsor_reject` (the paymaster did not decline) and NO `settle` (it did
-	 * not succeed). We deliberately do NOT require a `sponsor` span: validation is
-	 * simulated during gas estimation, which can reject BEFORE `getPaymasterData`
-	 * runs, so a granted-sponsorship span is not guaranteed to fire on a reject.
-	 * Positive attribution to the policy also rests on the H1 happy path
-	 * succeeding (the full sponsor→settle pipeline works) + the balance-unchanged
-	 * check in each case. This requires a blanket "sponsor-all" ZeroDev gas policy
-	 * — a recipient/amount-restricted gas policy would reject at the paymaster
-	 * (SponsorshipError) and mask the validator (README prerequisites).
+	 * SPONSORED negative — assert the DURABLE INVARIANT (Amoy run #1 / "Both"
+	 * resolution; see `docs/rfc/rfc0001-amoy-run1-evaluation.md`). The original strict
+	 * discriminator (must be a non-`SponsorshipError` `validation_reject`) was
+	 * SUPERSEDED by run #1: with ZeroDev's verifying paymaster, a Call/RateLimit
+	 * violation surfaces as `sponsor_reject` (the paymaster fail-fasts on a reverting
+	 * `validateUserOp` during pre-sign simulation) — which is NOT a security hole (no
+	 * funds move). So here we assert only the durable safety invariant — it **threw**
+	 * and **nothing `settle`d** (the caller also checks merchant balance unchanged) —
+	 * and we RECORD the branch via the `[F1 premise]` log WITHOUT hard-asserting it,
+	 * so the test survives ZeroDev paymaster-behavior changes. The on-chain validator
+	 * is proven the SOLE boundary by the paymaster-LESS N1–N4 (the §9 fallback).
+	 * Controlled comparison: H1 (in-scope) settles while N1–N3 (one param out-of-scope)
+	 * are rejected ⇒ the rejection is policy-caused.
 	 */
-	const expectPolicyValidationReject = async (
+	const expectPolicyEnforced = async (
 		run: (telemetry: HarnessTelemetry) => Promise<unknown>,
 	): Promise<void> => {
 		const { telemetry, spans } = createRecordingTelemetry();
@@ -143,22 +141,48 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 			threw = err;
 		}
 		const phases = spans.map((s) => s.phase);
-		// F1 premise visibility (RFC-0001 §8 premise gate): record which branch this negative
-		// actually took on-chain, so a BROKEN premise (verifying paymaster simulate-and-declining
-		// an out-of-allowlist op) is VISIBLE in test output, not silently misclassified. The
-		// premise HOLDS iff the throw is not a SponsorshipError AND no `sponsor_reject` span fired.
-		const premiseBroken = phases.includes("sponsor_reject") || threw instanceof SponsorshipError;
-		const branch = premiseBroken
-			? "sponsor_reject — ⛒ PREMISE BROKEN: paymaster declined (apply RFC-0001 §9 F1 fallback)"
-			: "validation_reject — premise holds: permission validator rejected";
+		const branch =
+			phases.includes("sponsor_reject") || threw instanceof SponsorshipError
+				? "sponsor_reject (paymaster fail-fast on a reverting validateUserOp — Call/RateLimit)"
+				: "validation_reject (bundler rejected — e.g. Timestamp)";
 		console.log(
-			`[F1 premise] negative branch: ${branch}; spans=[${phases.join(",")}]; threw=${
+			`[F1 premise] sponsored negative branch: ${branch}; spans=[${phases.join(",")}]; threw=${
 				threw instanceof Error ? threw.constructor.name : typeof threw
 			}`,
 		);
+		// Durable invariant only: rejected + nothing settled. Branch recorded, NOT asserted.
 		expect(threw, "expected the payment to be rejected").toBeInstanceOf(Error);
-		expect(threw, "a paymaster decline is NOT a policy rejection").not.toBeInstanceOf(SponsorshipError);
-		expect(phases, "paymaster must not have declined (F1 premise)").not.toContain("sponsor_reject");
+		expect(phases, "must not have settled").not.toContain("settle");
+	};
+
+	/**
+	 * PAYMASTER-LESS negative (the §9 fallback) — proves the ON-CHAIN permission
+	 * validator ALONE is the boundary, independent of paymaster behavior. No paymaster
+	 * is involved (self-paid via POL), so there is no `sponsor`/`sponsor_reject`/
+	 * `SponsorshipError`: a rejection MUST surface as the raw on-chain validation
+	 * error → `validation_reject`. This is the immutable, paymaster-independent proof
+	 * the sponsored path cannot give for revert-style policies (run #1).
+	 */
+	const expectOnChainValidationReject = async (
+		run: (telemetry: HarnessTelemetry) => Promise<unknown>,
+	): Promise<void> => {
+		const { telemetry, spans } = createRecordingTelemetry();
+		let threw: unknown;
+		try {
+			await run(telemetry);
+		} catch (err) {
+			threw = err;
+		}
+		const phases = spans.map((s) => s.phase);
+		console.log(
+			`[F1 fallback] paymaster-less negative: spans=[${phases.join(",")}]; threw=${
+				threw instanceof Error ? threw.constructor.name : typeof threw
+			}`,
+		);
+		expect(threw, "expected an on-chain validation rejection").toBeInstanceOf(Error);
+		expect(threw, "no paymaster ⇒ not a SponsorshipError").not.toBeInstanceOf(SponsorshipError);
+		expect(phases, "paymaster-less ⇒ no sponsor_reject").not.toContain("sponsor_reject");
+		expect(phases, "the on-chain validator must reject (validation_reject)").toContain("validation_reject");
 		expect(phases, "must not have settled").not.toContain("settle");
 	};
 
@@ -190,7 +214,7 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 		async () => {
 			const approval = await issue();
 			const before = await balanceOf(NON_ALLOWLISTED);
-			await expectPolicyValidationReject((telemetry) =>
+			await expectPolicyEnforced((telemetry) =>
 				agentPay({
 					cfg,
 					publicClient,
@@ -213,7 +237,7 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 		async () => {
 			const approval = await issue({ maxPerTransferUnits: parseUnits("0.001", cfg.jpycDecimals) });
 			const before = await balanceOf(cfg.merchant);
-			await expectPolicyValidationReject((telemetry) =>
+			await expectPolicyEnforced((telemetry) =>
 				agentPay({
 					cfg,
 					publicClient,
@@ -251,7 +275,7 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 				cache,
 			});
 			const before = await balanceOf(cfg.merchant);
-			await expectPolicyValidationReject((telemetry) =>
+			await expectPolicyEnforced((telemetry) =>
 				agentPay({
 					cfg,
 					publicClient,
@@ -275,7 +299,7 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 			const now = Math.floor(Date.now() / 1000);
 			const approval = await issue({ validAfter: now - 100, validUntil: now - 10 });
 			const before = await balanceOf(cfg.merchant);
-			await expectPolicyValidationReject((telemetry) =>
+			await expectPolicyEnforced((telemetry) =>
 				agentPay({
 					cfg,
 					publicClient,
@@ -375,4 +399,130 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 		},
 		120_000,
 	);
+
+	describe("§9 fallback — paymaster-less N1–N4 (on-chain validator is the SOLE boundary)", () => {
+		// The self-paid negatives need POL on the smart account so the bundler's prefund
+		// check passes — it is NOT consumed (they revert at validation). H1/H2 stay sponsored.
+		beforeAll(async () => {
+			const pf = await preflight({ cfg, publicClient, ownerSigner: owner, sessionSigner: session });
+			if (!pf.sufficientPolForSelfPaid) {
+				throw new Error(
+					`§9 fallback needs POL on ${pf.accountAddress} for the bundler prefund check ` +
+						`(have ${pf.polBalance} wei). Fund ~0.1 POL from the Amoy POL faucet ` +
+						`(https://faucet.polygon.technology/). It is NOT consumed — the negatives revert at validation.`,
+				);
+			}
+		}, 60_000);
+
+		it(
+			"N1 self-paid: recipient ∉ allowlist → on-chain validation_reject; balance unchanged",
+			async () => {
+				const approval = await issue();
+				const before = await balanceOf(NON_ALLOWLISTED);
+				await expectOnChainValidationReject((telemetry) =>
+					agentPay({
+						cfg,
+						publicClient,
+						serializedApproval: approval,
+						sessionSigner: session,
+						to: NON_ALLOWLISTED,
+						amount: parseUnits("0.001", cfg.jpycDecimals),
+						identity: { conversationId: "sp-n1", stepId: "pay-1" },
+						cache: freshCache(),
+						telemetry,
+						selfPaid: true,
+					}),
+				);
+				expect(await balanceOf(NON_ALLOWLISTED)).toBe(before);
+			},
+			180_000,
+		);
+
+		it(
+			"N2 self-paid: amount > maxPerTransfer → on-chain validation_reject; balance unchanged",
+			async () => {
+				const approval = await issue({ maxPerTransferUnits: parseUnits("0.001", cfg.jpycDecimals) });
+				const before = await balanceOf(cfg.merchant);
+				await expectOnChainValidationReject((telemetry) =>
+					agentPay({
+						cfg,
+						publicClient,
+						serializedApproval: approval,
+						sessionSigner: session,
+						to: cfg.merchant,
+						amount: parseUnits("1", cfg.jpycDecimals),
+						identity: { conversationId: "sp-n2", stepId: "pay-1" },
+						cache: freshCache(),
+						telemetry,
+						selfPaid: true,
+					}),
+				);
+				expect(await balanceOf(cfg.merchant)).toBe(before);
+			},
+			180_000,
+		);
+
+		it(
+			"N3 self-paid: (N+1)th payment within window → on-chain validation_reject (RateLimit)",
+			async () => {
+				// Consume the count with a SPONSORED first payment (no POL), then the self-paid
+				// 2nd hits the count bound → on-chain validation_reject (no POL consumed).
+				const approval = await issue({ maxTransfers: 1 });
+				const amount = parseUnits("0.001", cfg.jpycDecimals);
+				const cache = freshCache();
+				await agentPay({
+					cfg,
+					publicClient,
+					serializedApproval: approval,
+					sessionSigner: session,
+					to: cfg.merchant,
+					amount,
+					identity: { conversationId: "sp-n3", stepId: "pay-1" },
+					cache,
+				});
+				const before = await balanceOf(cfg.merchant);
+				await expectOnChainValidationReject((telemetry) =>
+					agentPay({
+						cfg,
+						publicClient,
+						serializedApproval: approval,
+						sessionSigner: session,
+						to: cfg.merchant,
+						amount,
+						identity: { conversationId: "sp-n3", stepId: "pay-2" },
+						cache,
+						telemetry,
+						selfPaid: true,
+					}),
+				);
+				expect(await balanceOf(cfg.merchant)).toBe(before);
+			},
+			300_000,
+		);
+
+		it(
+			"N4 self-paid: after validUntil → on-chain validation_reject (Timestamp); balance unchanged",
+			async () => {
+				const now = Math.floor(Date.now() / 1000);
+				const approval = await issue({ validAfter: now - 100, validUntil: now - 10 });
+				const before = await balanceOf(cfg.merchant);
+				await expectOnChainValidationReject((telemetry) =>
+					agentPay({
+						cfg,
+						publicClient,
+						serializedApproval: approval,
+						sessionSigner: session,
+						to: cfg.merchant,
+						amount: parseUnits("0.001", cfg.jpycDecimals),
+						identity: { conversationId: "sp-n4", stepId: "pay-1" },
+						cache: freshCache(),
+						telemetry,
+						selfPaid: true,
+					}),
+				);
+				expect(await balanceOf(cfg.merchant)).toBe(before);
+			},
+			180_000,
+		);
+	});
 });
