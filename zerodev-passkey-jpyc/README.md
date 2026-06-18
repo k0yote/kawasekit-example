@@ -1,0 +1,148 @@
+# RFC-0003 Cycle 1 — passkey (WebAuthn) owner e2e JPYC payment (Polygon Amoy)
+
+A runnable harness proving that a **passkey (WebAuthn P256) sudo owner** can drive
+the agent payment path on Amoy:
+
+- **P1** — a **passkey-signed userOp lands** (the owner-direct path): the headless
+  P256 authenticator signs a Kernel userOp, the ZeroDev passkey validator verifies
+  it on-chain (RIP-7212 precompile / Daimo fallback duo-mode), and a sponsored JPYC
+  transfer settles.
+- **P2** — the **de-risked RFC-0001 floor still holds under the passkey owner**: a
+  **buy-list-scoped session key** issued *under the passkey sudo* (`createBuyListPolicies`)
+  authorizes an allowlisted JPYC transfer, gas sponsored by a ZeroDev paymaster, and
+  every §8 negative (recipient / cap / count / window out-of-scope) is rejected with
+  **no funds moved**.
+
+**Amoy / zero-value / UNAUDITED.** Consumes `kawasekit@^0.8.0` as an external npm
+dependency (the SDK public-API boundary test — see "SDK boundary findings" below).
+
+## The passkey is a headless software authenticator (no browser, no `navigator`)
+
+The owner credential is a **software P256 authenticator** built with [`ox`](https://oxlib.sh)
+(`P256.sign` + `WebAuthnP256.getSignPayload`), persisted to `.passkey-cycle1.json`
+(gitignored, testnet-only) so the counterfactual account address stays stable across
+runs. There is **no `OWNER_PRIVATE_KEY`** — the owner is a WebAuthn key, and signing
+goes through ZeroDev's `signMessageCallback` seam:
+
+`(message: SignableMessage, rpId: string, chainId: number, allowCredentials?) => Promise<Hex>`
+
+The adapter (`account.ts`) returns a single ZeroDev-encoded `Hex`: it assembles the
+WebAuthn bytes via `ox` (`authenticatorData`, `clientDataJSON`, challenge/type
+indices, UP|UV flags), signs the payload with P256, and encodes them in the EXACT
+validator wire format copied verbatim from `@zerodev/passkey-validator`'s own
+`signMessageUsingWebAuthn` (`responseTypeLocation = findQuoteIndices(...).beforeType`,
+`usePrecompiled = isRIP7212SupportedNetwork(chainId)`). The off-chain half (the
+authenticator bytes verify against the public key for a given challenge) is pinned
+by `passkey.test.ts` (`ox/WebAuthnP256.verify`, always-run); the on-chain half is
+proven by P1.
+
+## Prerequisites (owner action required before a live run)
+
+1. **JPYC on Amoy.** Fill `JPYC_ADDRESS_AMOY` + `JPYC_DECIMALS` from the
+   **official JPYC faucet/docs**, verified on [Amoy PolygonScan](https://amoy.polygonscan.com).
+   Do **not** trust a search-derived address. The harness asserts on-chain
+   `decimals()` matches and that the address equals kawasekit's built-in
+   `getJpycAddress(80002)` at startup, and aborts on mismatch.
+2. **Fund the PASSKEY smart account** — the **counterfactual Kernel account** (derived
+   from the passkey sudo validator, *not* an EOA). Two distinct accounts are involved:
+   - **P1 (owner-direct):** the passkey-sudo-only account. `pnpm passkey:p1`
+     (`probe-passkey.ts`) prints its address; fund it with a little JPYC.
+   - **P2 (session-key floor):** the passkey-sudo + buy-list-session account. Run the
+     **preflight** (head of `pnpm zerodev:passkey:demo`, or call `preflight()`) to print
+     that exact address + its JPYC and POL balances. Fund it:
+     - **JPYC** (Amoy faucet) — ≥ 1 JPYC for the full §8 suite.
+     - **~0.1 POL** (Amoy POL faucet, https://faucet.polygon.technology/) — **only** for
+       the **paymaster-less** N1–N4 (the bundler prefund check); it is **NOT consumed**
+       (those ops revert at validation). The **sponsored** path (H1/H2 + sponsored
+       N1–N4) needs **0 POL**.
+3. **Set a blanket "sponsor-all" ZeroDev gas policy on the Amoy project BEFORE
+   running**, covering the demo userOps. Without it the paymaster declines and the
+   harness throws a `SponsorshipError` (there is **no** owner-pays-gas fallback, by
+   design). The gas policy MUST NOT restrict recipient/amount: the §8 negatives
+   (N1–N4) prove the *permission validator* is the boundary, so a gas policy that
+   itself filtered recipient/amount would reject at the paymaster instead and mask
+   the validator.
+4. **ZeroDev project**: bundler + paymaster RPC (`ZERODEV_RPC`) and
+   `ZERODEV_PROJECT_ID` from the dashboard (Amoy project).
+5. **`PASSKEY_RPID`** (optional): the WebAuthn relying-party id (defaults to
+   `kawasekit.local`). It is baked into the credential; changing it changes the
+   account address.
+6. **Session key** (`SESSION_PRIVATE_KEY`): testnet-only, never reused from any
+   value-bearing context. (The owner is a passkey — there is no owner private key.)
+
+## Setup
+
+Copy the vars from the repo-root `.env.example` into the repo-root `.env`
+(gitignored) and fill them in (note: **no `OWNER_PRIVATE_KEY`**; add `PASSKEY_RPID`
+if not using the default). Then:
+
+```sh
+pnpm install              # installs kawasekit@0.8.0 + aligned @zerodev/* + ox + vitest
+pnpm passkey:p1           # P1: prints the owner-direct account to fund, then lands a passkey userOp
+pnpm zerodev:passkey:demo # P2: preflight (prints the session-key account to fund) then the happy path
+pnpm test:rfc0003         # this harness only — unit always; integration runs when the live env is set
+pnpm typecheck:rfc0003    # typecheck this harness only (independent of the rest of the repo)
+```
+
+`pnpm test:rfc0003` runs the suite: **unit** cases always (idempotency-key
+determinism, observability emit + the sponsor/validation reject routing, buy-list
+mapping; plus `passkey.test.ts`'s off-chain ox verify), and **integration** cases
+(P1 + P2's H1/H2/N1–N4/I1/I2 + preflight) that auto-skip unless the full live env
+is present.
+
+> **Independent gate (RFC §11).** `test:rfc0003` and `typecheck:rfc0003` (the latter
+> via a dedicated `./tsconfig.json`) exercise *only* this harness, so they stay green
+> **without** the private `@kawasekit/mpc-2p` optional dep that the repo's other
+> examples need.
+
+## Acceptance (RFC-0003 Cycle 1)
+
+A passing live run =
+
+- **P1** — `pnpm passkey:p1` lands a passkey-signed sponsored JPYC transfer on Amoy
+  (`success: true`, merchant balance +amount). The harness P1 integration test asserts
+  the same. **= the adapter + duo-mode P256 verification work on-chain.**
+- **P2** — the full RFC-0001 §8 floor, issued **under the passkey owner**, all hold:
+  - **H1/H2** — sponsored happy path settles (H2 = 0 POL on the account).
+  - **sponsored N1–N4** — the durable invariant (`expectPolicyEnforced`): threw + **no
+    `settle`** + merchant `balanceOf` unchanged, the `sponsor_reject`/`validation_reject`
+    branch **recorded** (per RFC-0001 F1) but not hard-asserted.
+  - **paymaster-less N1–N4** — `expectOnChainValidationReject`: self-paid (POL) so the
+    **on-chain permission validator is the SOLE rejecter**; every negative is a
+    `validation_reject` with no `settle` and balance unchanged. The immutable,
+    paymaster-independent proof that the floor survives the ECDSA→passkey owner swap.
+
+**Live run result — Amoy 2026-06-18: 20/20 PASS ✅** (`pnpm test:rfc0003`; 4 harness
+unit + 3 ox-verify + 13 integration). **P1** ✅ — passkey-signed userOp landed
+([tx `0xeff3008c…cebdd`](https://amoy.polygonscan.com/tx/0xeff3008c4e233e46021aec4b8d0284df35ea66427d7b8f3beabecfd707fcebdd)).
+**P2** ✅ — H1/H2 settle ([demo tx `0x509c806c…3567`](https://amoy.polygonscan.com/tx/0x509c806c440b549c49a3a6f73a884303a67ac5526e4932261e4ccccb0bbc3567));
+sponsored N1–N3 `sponsor_reject`, N4 `validation_reject`; paymaster-less N1–N4 all
+`validation_reject`; merchant balance unchanged in every negative. **The de-risked
+RFC-0001 floor survives the ECDSA→passkey owner swap byte-for-byte.**
+
+**I1** = a replay of the same `{conversationId, stepId}` returns the cached result
+without a second submission (call-level, in-process dedup only; the on-chain
+rateLimit count is the real over-spend backstop). **I2** = submit/sponsor/settle
+spans emit.
+
+## SDK boundary finding (RFC-0003 §11) — passkey-issuance helper is the Cycle-1 follow-up
+
+kawasekit's `issueSessionKey` / `createAgentSmartAccount` build the sudo via
+`signerToEcdsaValidator` (**ECDSA-only**). So P2 **cannot** issue a session key under
+a passkey owner through kawasekit's current API. The harness works around this in
+`issuePasskeyScopedSessionKey` (`harness.ts`): it builds the account **raw** with
+`@zerodev` — `sudo` = the passkey validator (`@zerodev/passkey-validator`), `regular`
+= the buy-list permission validator (policies from kawasekit's `createBuyListPolicies`)
+— then wraps ZeroDev's `serializePermissionAccount` blob in kawasekit's
+`serializeSessionEnvelope` so the **agent side is byte-for-byte RFC-0001**
+(`parseSessionEnvelope` + `restoreSessionAccount` + `transferJpyc`, unchanged).
+
+A **passkey-capable issuance helper** in kawasekit (an `issueSessionKey` variant that
+accepts a non-ECDSA sudo validator) would close this — the analog of RFC-0001's G1,
+and directly relevant to the Hub design where the owner is a passkey. Recorded as the
+Cycle-1 SDK gap.
+
+What kawasekit covered as-is (no internals): `createBuyListPolicies`;
+`createSponsoredKernelClient`; `serializeSessionEnvelope` / `parseSessionEnvelope` /
+`restoreSessionAccount` / `KAWASEKIT_SESSION_ENVELOPE_VERSION`; `transferJpyc`;
+`jpycAbi` / `getJpycAddress` / `polygonAmoy`; `deriveIdempotencyKey`.

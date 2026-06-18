@@ -12,6 +12,7 @@
     "dev:server": "tsx server/index.ts",
     "dev:agent": "tsx agent/index.ts",
     "zerodev:demo": "tsx zerodev-agent-jpyc/run-demo.ts",
+    "zerodev:passkey:demo": "tsx zerodev-passkey-jpyc/run-demo.ts",
     "test": "vitest run",
     "test:rfc0001": "vitest run zerodev-agent-jpyc",
     "test:rfc0003": "vitest run zerodev-passkey-jpyc",

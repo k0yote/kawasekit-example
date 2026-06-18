@@ -67,13 +67,16 @@ export function passkeySignMessageCallback(passkey: SoftwarePasskey) {
 	};
 }
 
-/** Build a Kernel v0.7 account whose SUDO is the passkey validator, signing headless. */
-export async function createPasskeyAccount(params: {
-	readonly publicClient: PublicClient<Transport, Chain>;
-	readonly passkey: SoftwarePasskey;
-	readonly rpID: string;
-}): Promise<CreateKernelAccountReturnType<"0.7">> {
-	const { publicClient, passkey, rpID } = params;
+/**
+ * Build the passkey **validator** (reusable as a Kernel sudo). Factored out so both
+ * the P1 owner-only account and the P2 session-key account (sudo = passkey, regular =
+ * permission validator) can root on the same headless passkey.
+ */
+export async function buildPasskeyValidator(
+	publicClient: PublicClient<Transport, Chain>,
+	passkey: SoftwarePasskey,
+	rpID: string,
+) {
 	const entryPoint = getEntryPoint("0.7");
 	// authenticatorIdHash exactly as @zerodev derives it (keccak256 of the raw credential bytes).
 	const authenticatorIdHash = keccak256(uint8ArrayToHexString(b64ToBytes(passkey.id)));
@@ -90,15 +93,25 @@ export async function createPasskeyAccount(params: {
 		rpID,
 		mode: WebAuthnMode.Login,
 	});
-	const passkeyValidator = await toPasskeyValidator(publicClient, {
+	return toPasskeyValidator(publicClient, {
 		webAuthnKey,
 		entryPoint,
 		kernelVersion: KERNEL_V3_1,
 		validatorContractVersion: PasskeyValidatorContractVersion.V0_0_3_PATCHED,
 	});
+}
+
+/** Build a Kernel v0.7 account whose SUDO is the passkey validator, signing headless. */
+export async function createPasskeyAccount(params: {
+	readonly publicClient: PublicClient<Transport, Chain>;
+	readonly passkey: SoftwarePasskey;
+	readonly rpID: string;
+}): Promise<CreateKernelAccountReturnType<"0.7">> {
+	const { publicClient, passkey, rpID } = params;
+	const passkeyValidator = await buildPasskeyValidator(publicClient, passkey, rpID);
 	return createKernelAccount(publicClient, {
 		plugins: { sudo: passkeyValidator },
-		entryPoint,
+		entryPoint: getEntryPoint("0.7"),
 		kernelVersion: KERNEL_V3_1,
 	});
 }
