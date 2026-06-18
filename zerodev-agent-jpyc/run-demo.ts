@@ -15,7 +15,7 @@ import "dotenv/config";
 import type { TransferJpycResult } from "kawasekit";
 import { parseUnits } from "viem";
 import { accountsFromConfig, assertJpycOnChain, loadConfig, makePublicClient } from "./env.ts";
-import { agentPay, buildBuyList, issueScopedSessionKey } from "./harness.ts";
+import { agentPay, buildBuyList, issueScopedSessionKey, preflight } from "./harness.ts";
 import { consoleTelemetry } from "./observability.ts";
 
 async function main(): Promise<void> {
@@ -34,6 +34,13 @@ async function main(): Promise<void> {
 	console.log(
 		`  cap      : ${buyList.maxPerTransfer} units  count: ${buyList.maxTransfers}  validUntil: ${buyList.validUntil}`,
 	);
+
+	console.log("\n[preflight] resolving the counterfactual account + checking JPYC funding…");
+	const pf = await preflight({ cfg, publicClient, ownerSigner: owner, sessionSigner: session });
+	if (!pf.sufficientForHappyPath) {
+		console.error("\nAborting: the smart account is not funded with JPYC. Fund the address above, then re-run.");
+		process.exit(1);
+	}
 
 	console.log("\n[owner] issuing scoped session key…");
 	const approval = await issueScopedSessionKey({

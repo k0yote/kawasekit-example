@@ -14,7 +14,7 @@
 import { invokeHookSafely } from "kawasekit/observability";
 import type { Address, Hex } from "viem";
 
-export type HarnessPhase = "submit" | "sponsor" | "settle" | "validation_reject";
+export type HarnessPhase = "submit" | "sponsor" | "sponsor_reject" | "settle" | "validation_reject";
 
 export interface HarnessSpan {
 	readonly phase: HarnessPhase;
@@ -29,7 +29,10 @@ export interface HarnessSpan {
 /** Hook callbacks — same optional-per-phase shape as `ObservabilityHooks`. */
 export interface HarnessTelemetry {
 	readonly onSubmit?: (span: HarnessSpan) => void;
+	/** Sponsorship GRANTED (emitted only after `sponsorUserOperation` succeeds). */
 	readonly onSponsor?: (span: HarnessSpan) => void;
+	/** Sponsorship DECLINED by the paymaster (NOT a policy rejection). */
+	readonly onSponsorReject?: (span: HarnessSpan) => void;
 	readonly onSettle?: (span: HarnessSpan) => void;
 	readonly onValidationReject?: (span: HarnessSpan) => void;
 }
@@ -42,23 +45,34 @@ function now(): number {
 /** Emit a phase span through the SDK's safe-invoke (errors in a hook never break the flow). */
 export function emit(telemetry: HarnessTelemetry | undefined, span: HarnessSpan): void {
 	if (telemetry === undefined) return;
-	const hook =
-		span.phase === "submit"
-			? telemetry.onSubmit
-			: span.phase === "sponsor"
-				? telemetry.onSponsor
-				: span.phase === "settle"
-					? telemetry.onSettle
-					: telemetry.onValidationReject;
+	let hook: ((span: HarnessSpan) => void) | undefined;
+	switch (span.phase) {
+		case "submit":
+			hook = telemetry.onSubmit;
+			break;
+		case "sponsor":
+			hook = telemetry.onSponsor;
+			break;
+		case "sponsor_reject":
+			hook = telemetry.onSponsorReject;
+			break;
+		case "settle":
+			hook = telemetry.onSettle;
+			break;
+		case "validation_reject":
+			hook = telemetry.onValidationReject;
+			break;
+	}
 	invokeHookSafely(hook, span);
 }
 
 /** A console telemetry impl for the runnable demo. */
 export const consoleTelemetry: HarnessTelemetry = {
-	onSubmit: (s) => console.log(`  [submit]  account=${s.account} → ${s.to} amount=${s.amount}`),
-	onSponsor: (s) => console.log(`  [sponsor] paymaster sponsoring userOp${s.detail ? ` (${s.detail})` : ""}`),
-	onSettle: (s) => console.log(`  [settle]  tx=${s.transaction}`),
-	onValidationReject: (s) => console.log(`  [reject]  ${s.detail ?? "userOp rejected at validation"}`),
+	onSubmit: (s) => console.log(`  [submit]   account=${s.account} → ${s.to} amount=${s.amount}`),
+	onSponsor: (s) => console.log(`  [sponsor]  paymaster GRANTED sponsorship${s.detail ? ` (${s.detail})` : ""}`),
+	onSponsorReject: (s) => console.log(`  [sponsor!] paymaster DECLINED to sponsor${s.detail ? ` (${s.detail})` : ""}`),
+	onSettle: (s) => console.log(`  [settle]   tx=${s.transaction}`),
+	onValidationReject: (s) => console.log(`  [reject]   ${s.detail ?? "userOp rejected at validation"}`),
 };
 
 /** A capturing telemetry impl for tests (I2): records every span. */
@@ -67,6 +81,12 @@ export function createRecordingTelemetry(): { telemetry: HarnessTelemetry; spans
 	const push = (s: HarnessSpan) => spans.push(s);
 	return {
 		spans,
-		telemetry: { onSubmit: push, onSponsor: push, onSettle: push, onValidationReject: push },
+		telemetry: {
+			onSubmit: push,
+			onSponsor: push,
+			onSponsorReject: push,
+			onSettle: push,
+			onValidationReject: push,
+		},
 	};
 }

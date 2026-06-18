@@ -13,7 +13,9 @@
     "dev:agent": "tsx agent/index.ts",
     "zerodev:demo": "tsx zerodev-agent-jpyc/run-demo.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "test:rfc0001": "vitest run zerodev-agent-jpyc",
+    "typecheck": "tsc --noEmit",
+    "typecheck:rfc0001": "tsc --noEmit -p zerodev-agent-jpyc/tsconfig.json"
   },
   "dependencies": {
     "@hono/node-server": "2.0.3",
@@ -22,7 +24,7 @@
     "@zerodev/sdk": "5.5.10",
     "dotenv": "17.4.2",
     "hono": "4.12.22",
-    "kawasekit": "^0.7.0",
+    "kawasekit": "^0.8.0",
     "viem": "2.50.4"
   },
   "optionalDependencies": {

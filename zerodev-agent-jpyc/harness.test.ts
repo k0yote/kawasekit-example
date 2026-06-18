@@ -12,12 +12,13 @@
 
 import "dotenv/config";
 
-import { deriveIdempotencyKey, jpycAbi, type TransferJpycResult } from "kawasekit";
+import { deriveIdempotencyKey, jpycAbi, parseSessionEnvelope, type TransferJpycResult } from "kawasekit";
 import { type Address, getAddress, parseUnits } from "viem";
 import { beforeAll, describe, expect, it } from "vitest";
 import { accountsFromConfig, assertJpycOnChain, loadConfig, makePublicClient, type RfcConfig } from "./env.ts";
-import { agentPay, buildBuyList, issueScopedSessionKey } from "./harness.ts";
-import { createRecordingTelemetry, emit } from "./observability.ts";
+import { SponsorshipError } from "./errors.ts";
+import { agentPay, buildBuyList, issueScopedSessionKey, preflight } from "./harness.ts";
+import { createRecordingTelemetry, emit, type HarnessTelemetry } from "./observability.ts";
 
 const LIVE_VARS = [
 	"AMOY_RPC",
@@ -56,6 +57,20 @@ describe("RFC-0001 unit (no chain)", () => {
 		emit(telemetry, { phase: "sponsor", at: 2 });
 		emit(telemetry, { phase: "settle", at: 3, transaction: `0x${"ab".repeat(32)}` });
 		expect(spans.map((s) => s.phase)).toEqual(["submit", "sponsor", "settle"]);
+	});
+
+	it("emit() routes sponsor_reject + validation_reject distinctly (H1 discriminator)", () => {
+		// The §8 de-risk hinges on telling a PAYMASTER decline (`sponsor_reject`) apart from
+		// a PERMISSION-VALIDATOR reject (`sponsor` then `validation_reject`). Exercise the
+		// routing in the always-run unit suite so the discriminator can't silently regress.
+		const declined = createRecordingTelemetry();
+		emit(declined.telemetry, { phase: "sponsor_reject", at: 1, detail: "paymaster declined" });
+		expect(declined.spans.map((s) => s.phase)).toEqual(["sponsor_reject"]);
+
+		const rejected = createRecordingTelemetry();
+		emit(rejected.telemetry, { phase: "sponsor", at: 1 });
+		emit(rejected.telemetry, { phase: "validation_reject", at: 2, detail: "ONE_OF" });
+		expect(rejected.spans.map((s) => s.phase)).toEqual(["sponsor", "validation_reject"]);
 	});
 
 	it("buildBuyList maps config → policy inputs (allowlist = merchant, cap = parseUnits)", () => {
@@ -100,6 +115,53 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 		});
 	const freshCache = (): Map<string, TransferJpycResult> => new Map();
 
+	/**
+	 * Assert a payment was rejected by the on-chain PERMISSION VALIDATOR — NOT by
+	 * the paymaster. This is the real §8 G3 discriminator: a bare
+	 * `rejects.toThrow()` would also pass for a paymaster sponsorship decline,
+	 * masking whether `createBuyListPolicies` is actually the boundary.
+	 *
+	 * The throw must NOT be a `SponsorshipError` and the span stream must carry
+	 * NO `sponsor_reject` (the paymaster did not decline) and NO `settle` (it did
+	 * not succeed). We deliberately do NOT require a `sponsor` span: validation is
+	 * simulated during gas estimation, which can reject BEFORE `getPaymasterData`
+	 * runs, so a granted-sponsorship span is not guaranteed to fire on a reject.
+	 * Positive attribution to the policy also rests on the H1 happy path
+	 * succeeding (the full sponsor→settle pipeline works) + the balance-unchanged
+	 * check in each case. This requires a blanket "sponsor-all" ZeroDev gas policy
+	 * — a recipient/amount-restricted gas policy would reject at the paymaster
+	 * (SponsorshipError) and mask the validator (README prerequisites).
+	 */
+	const expectPolicyValidationReject = async (
+		run: (telemetry: HarnessTelemetry) => Promise<unknown>,
+	): Promise<void> => {
+		const { telemetry, spans } = createRecordingTelemetry();
+		let threw: unknown;
+		try {
+			await run(telemetry);
+		} catch (err) {
+			threw = err;
+		}
+		const phases = spans.map((s) => s.phase);
+		// F1 premise visibility (RFC-0001 §8 premise gate): record which branch this negative
+		// actually took on-chain, so a BROKEN premise (verifying paymaster simulate-and-declining
+		// an out-of-allowlist op) is VISIBLE in test output, not silently misclassified. The
+		// premise HOLDS iff the throw is not a SponsorshipError AND no `sponsor_reject` span fired.
+		const premiseBroken = phases.includes("sponsor_reject") || threw instanceof SponsorshipError;
+		const branch = premiseBroken
+			? "sponsor_reject — ⛒ PREMISE BROKEN: paymaster declined (apply RFC-0001 §9 F1 fallback)"
+			: "validation_reject — premise holds: permission validator rejected";
+		console.log(
+			`[F1 premise] negative branch: ${branch}; spans=[${phases.join(",")}]; threw=${
+				threw instanceof Error ? threw.constructor.name : typeof threw
+			}`,
+		);
+		expect(threw, "expected the payment to be rejected").toBeInstanceOf(Error);
+		expect(threw, "a paymaster decline is NOT a policy rejection").not.toBeInstanceOf(SponsorshipError);
+		expect(phases, "paymaster must not have declined (F1 premise)").not.toContain("sponsor_reject");
+		expect(phases, "must not have settled").not.toContain("settle");
+	};
+
 	it(
 		"H1+H2: in-scope payment lands on-chain with sponsored gas; merchant balance increases",
 		async () => {
@@ -124,11 +186,11 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 	);
 
 	it(
-		"N1: recipient ∉ allowlist → reverts at validation; merchant balance unchanged",
+		"N1: recipient ∉ allowlist → rejected by the permission validator; balance unchanged",
 		async () => {
 			const approval = await issue();
 			const before = await balanceOf(NON_ALLOWLISTED);
-			await expect(
+			await expectPolicyValidationReject((telemetry) =>
 				agentPay({
 					cfg,
 					publicClient,
@@ -138,19 +200,20 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 					amount: parseUnits("0.001", cfg.jpycDecimals),
 					identity: { conversationId: "n1", stepId: "pay-1" },
 					cache: freshCache(),
+					telemetry,
 				}),
-			).rejects.toThrow();
+			);
 			expect(await balanceOf(NON_ALLOWLISTED)).toBe(before);
 		},
 		180_000,
 	);
 
 	it(
-		"N2: amount > maxPerTransfer → reverts at validation; merchant balance unchanged",
+		"N2: amount > maxPerTransfer → rejected by the permission validator; balance unchanged",
 		async () => {
 			const approval = await issue({ maxPerTransferUnits: parseUnits("0.001", cfg.jpycDecimals) });
 			const before = await balanceOf(cfg.merchant);
-			await expect(
+			await expectPolicyValidationReject((telemetry) =>
 				agentPay({
 					cfg,
 					publicClient,
@@ -160,16 +223,20 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 					amount: parseUnits("1", cfg.jpycDecimals),
 					identity: { conversationId: "n2", stepId: "pay-1" },
 					cache: freshCache(),
+					telemetry,
 				}),
-			).rejects.toThrow();
+			);
 			expect(await balanceOf(cfg.merchant)).toBe(before);
 		},
 		180_000,
 	);
 
 	it(
-		"N3: (N+1)th payment within window → reverts (RateLimit window-total, no reset)",
+		"N3: (N+1)th payment within window → rejected by RateLimit (count bound = maxTransfers)",
 		async () => {
+			// Proves the COUNT BOUND is enforced. The no-mid-window-RESET property rests on the
+			// createBuyListPolicies encoding (interval = validUntil − validAfter, one bucket),
+			// unit-asserted in kawasekit test/buy-list-policy.test.ts — not on this on-chain case.
 			const approval = await issue({ maxTransfers: 1 });
 			const amount = parseUnits("0.001", cfg.jpycDecimals);
 			const cache = freshCache();
@@ -184,7 +251,7 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 				cache,
 			});
 			const before = await balanceOf(cfg.merchant);
-			await expect(
+			await expectPolicyValidationReject((telemetry) =>
 				agentPay({
 					cfg,
 					publicClient,
@@ -194,20 +261,21 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 					amount,
 					identity: { conversationId: "n3", stepId: "pay-2" },
 					cache,
+					telemetry,
 				}),
-			).rejects.toThrow();
+			);
 			expect(await balanceOf(cfg.merchant)).toBe(before);
 		},
 		300_000,
 	);
 
 	it(
-		"N4: after validUntil → reverts (Timestamp); merchant balance unchanged",
+		"N4: after validUntil → rejected by the Timestamp policy; balance unchanged",
 		async () => {
 			const now = Math.floor(Date.now() / 1000);
 			const approval = await issue({ validAfter: now - 100, validUntil: now - 10 });
 			const before = await balanceOf(cfg.merchant);
-			await expect(
+			await expectPolicyValidationReject((telemetry) =>
 				agentPay({
 					cfg,
 					publicClient,
@@ -217,8 +285,9 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 					amount: parseUnits("0.001", cfg.jpycDecimals),
 					identity: { conversationId: "n4", stepId: "pay-1" },
 					cache: freshCache(),
+					telemetry,
 				}),
-			).rejects.toThrow();
+			);
 			expect(await balanceOf(cfg.merchant)).toBe(before);
 		},
 		180_000,
@@ -281,5 +350,29 @@ describe.skipIf(!LIVE)("RFC-0001 integration on Amoy (live env + ZeroDev gas pol
 			expect(phases).toContain("settle");
 		},
 		180_000,
+	);
+
+	it(
+		"preflight: reports the SAME counterfactual account the agent pays from, + funding guidance",
+		async () => {
+			const lines: string[] = [];
+			const pf = await preflight({
+				cfg,
+				publicClient,
+				ownerSigner: owner,
+				sessionSigner: session,
+				log: (l) => lines.push(l),
+			});
+			expect(pf.accountAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
+			expect(typeof pf.jpycBalance).toBe("bigint");
+			// The address preflight tells you to FUND must be exactly the address the agent
+			// restores and pays from — both derive from the owner sudo validator (deterministic).
+			const env = parseSessionEnvelope(await issue());
+			expect(env.smartAccountAddress).toBe(pf.accountAddress);
+			const guidance = lines.join("\n");
+			expect(guidance).toContain(pf.accountAddress);
+			expect(guidance).toContain("FUND THIS");
+		},
+		120_000,
 	);
 });

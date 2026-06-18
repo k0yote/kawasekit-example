@@ -3,19 +3,21 @@
  * agent pays an allowlisted merchant in JPYC via a session-key userOp with gas
  * sponsored by a paymaster (Option A: the userOp IS the settlement). Amoy only.
  *
- * Prefers kawasekit's public helpers; the ONE boundary gap is the sponsored
- * kernel-account CLIENT construction (kawasekit exposes `transferJpyc(client,…)`
- * + the `ConfiguredKernelClient` type but no helper to BUILD the client with a
- * ZeroDev bundler + paymaster), so `buildSponsoredKernelClient` drops to the raw
- * `@zerodev/sdk`. See README "SDK boundary findings".
+ * Uses kawasekit's public helpers throughout — including
+ * `createSponsoredKernelClient` for the gas-sponsored client construction (SDK
+ * gaps G1/G4 closed: no raw `@zerodev/sdk` wiring, no cast). The harness maps the
+ * SDK's sponsorship observability onto its own `sponsor`/`sponsor_reject` spans.
+ * See README "SDK boundary findings".
  */
 
-import { createKernelAccountClient, createZeroDevPaymasterClient } from "@zerodev/sdk";
+import type { CreateKernelAccountReturnType } from "@zerodev/sdk";
 import {
 	type ConfiguredKernelClient,
 	createBuyListPolicies,
+	createSponsoredKernelClient,
 	deriveIdempotencyKey,
 	issueSessionKey,
+	jpycAbi,
 	parseSessionEnvelope,
 	restoreSessionAccount,
 	serializeSessionEnvelope,
@@ -25,7 +27,7 @@ import {
 import {
 	type Address,
 	type Chain,
-	http,
+	formatUnits,
 	type LocalAccount,
 	parseUnits,
 	type PublicClient,
@@ -68,9 +70,12 @@ export function buildBuyList(cfg: RfcConfig, o: BuyListOverrides = {}): Resolved
 
 /**
  * OWNER side — bake the buy-list into a disposable session key and hand the
- * agent the serialized approval. `issueSessionKey` only uses the session
- * account's ADDRESS (it wraps `addressToEmptyAccount` internally), so the owner
- * never signs with the session key.
+ * agent the serialized approval. NOTE: kawasekit's `issueSessionKey` builds the
+ * permission account with the REAL session signer (`toECDSASigner`), so the
+ * issuer must hold the session private key at issuance time — it does NOT use
+ * `addressToEmptyAccount`. The owner EOA remains the sole sudo authority; an
+ * address-only issuance path (agent self-generates the key, owner ever sees only
+ * the address) is a possible SDK follow-up (README G2 / RFC §10).
  */
 export async function issueScopedSessionKey(params: {
 	readonly cfg: RfcConfig;
@@ -98,39 +103,114 @@ export async function issueScopedSessionKey(params: {
 	return serializeSessionEnvelope(envelope);
 }
 
+/** What {@link preflight} reports back to the caller. */
+export interface PreflightResult {
+	/** The counterfactual Kernel address that holds JPYC and pays — FUND THIS. */
+	readonly accountAddress: Address;
+	/** Current on-chain JPYC balance of that account (raw units). */
+	readonly jpycBalance: bigint;
+	/** Whether the account bytecode is already on-chain (else the 1st userOp deploys it). */
+	readonly deployed: boolean;
+	/** True if the balance covers at least the H1 happy-path payment. */
+	readonly sufficientForHappyPath: boolean;
+}
+
 /**
- * BOUNDARY GAP (RFC §6.4): build a sponsored Kernel client. kawasekit has no
- * public helper for this — raw `@zerodev/sdk`. Sponsorship rejection is surfaced
- * as a SponsorshipError; there is NO owner-pays-gas fallback (RFC §6.2/7).
+ * PREFLIGHT (RFC §7 / §11) — the live run's #1 failure mode is funding the wrong
+ * address or a gas policy that can't deploy the account. This derives the EXACT
+ * counterfactual Kernel address the agent will pay from (via the same issuance
+ * path → envelope `smartAccountAddress`; issuance is LOCAL — no tx, no gas, no
+ * funds needed), reads its JPYC balance + deployment state, and prints clear
+ * funding guidance. It NEVER auto-funds and sends no transaction.
+ */
+export async function preflight(params: {
+	readonly cfg: RfcConfig;
+	readonly publicClient: PublicClient<Transport, Chain>;
+	readonly ownerSigner: LocalAccount;
+	readonly sessionSigner: LocalAccount;
+	/** Sink for the guidance lines (defaults to `console.log`; tests inject a recorder). */
+	readonly log?: (line: string) => void;
+}): Promise<PreflightResult> {
+	const { cfg, publicClient } = params;
+	const log = params.log ?? ((line: string) => console.log(line));
+
+	// Issue locally (no tx) to obtain the same account the agent restores from.
+	const serialized = await issueScopedSessionKey({
+		cfg,
+		publicClient,
+		ownerSigner: params.ownerSigner,
+		sessionSigner: params.sessionSigner,
+		buyList: buildBuyList(cfg),
+	});
+	const accountAddress = parseSessionEnvelope(serialized).smartAccountAddress;
+
+	const [jpycBalance, code] = await Promise.all([
+		publicClient.readContract({
+			address: cfg.jpycAddress,
+			abi: jpycAbi,
+			functionName: "balanceOf",
+			args: [accountAddress],
+		}) as Promise<bigint>,
+		publicClient.getCode({ address: accountAddress }),
+	]);
+	const deployed = code !== undefined && code !== "0x";
+	const happyPathFloor = parseUnits("0.001", cfg.jpycDecimals);
+	const sufficientForHappyPath = jpycBalance >= happyPathFloor;
+
+	log("── RFC-0001 preflight ─────────────────────────────────────────");
+	log(`  smart account (FUND THIS) : ${accountAddress}`);
+	log(`  JPYC balance              : ${formatUnits(jpycBalance, cfg.jpycDecimals)} JPYC`);
+	log(
+		`  account deployed          : ${
+			deployed ? "yes" : "no — the first userOp deploys it (gas policy MUST cover deploy+transfer)"
+		}`,
+	);
+	if (sufficientForHappyPath) {
+		log("  funding                   : ✅ enough for the H1 happy path");
+	} else {
+		log(
+			`  funding                   : ⚠️  below ${formatUnits(happyPathFloor, cfg.jpycDecimals)} JPYC — send JPYC to the address above`,
+		);
+		log("                              from the JPYC Amoy faucet (recommend ≥ 1 JPYC for the full §8 suite).");
+	}
+	log("  gas (POL)                 : sponsored by the paymaster — do NOT fund POL to this account.");
+	log("───────────────────────────────────────────────────────────────");
+
+	return { accountAddress, jpycBalance, deployed, sufficientForHappyPath };
+}
+
+/**
+ * Build a sponsored Kernel client via the kawasekit SDK helper
+ * `createSponsoredKernelClient` (no bespoke `@zerodev` wiring, no cast — SDK gaps
+ * G1/G4 closed). The harness maps the SDK's sponsorship observability onto its own
+ * spans (`sponsor` / `sponsor_reject`) and reports the LATEST sponsor outcome via
+ * `onSponsorOutcome(declined)` so `agentPay` can surface a typed `SponsorshipError`
+ * (no owner-pays fallback). Latest-wins (not sticky) is robust to `getPaymasterData`
+ * firing more than once per send with mixed outcomes (review finding F4). This
+ * keeps the §8 N1–N4 paymaster-vs-validator discriminator intact.
  */
 export function buildSponsoredKernelClient(params: {
-	// biome-ignore lint/suspicious/noExplicitAny: kawasekit-restored Kernel account; the client's exact generic args are erased to ConfiguredKernelClient below.
-	readonly account: any;
+	readonly account: CreateKernelAccountReturnType<"0.7">;
 	readonly cfg: RfcConfig;
 	readonly telemetry?: HarnessTelemetry;
+	readonly onSponsorOutcome?: (declined: boolean) => void;
 }): ConfiguredKernelClient {
-	const { cfg, account, telemetry } = params;
-	const paymaster = createZeroDevPaymasterClient({ chain: cfg.chain, transport: http(cfg.zerodevRpc) });
-	// biome-ignore lint/suspicious/noExplicitAny: createKernelAccountClient's deep generics don't unify with the exported ConfiguredKernelClient alias; transferJpyc accepts ConfiguredKernelClient — same runtime client.
-	const client = createKernelAccountClient({
-		account,
+	const { cfg, telemetry } = params;
+	return createSponsoredKernelClient({
+		account: params.account,
 		chain: cfg.chain,
-		bundlerTransport: http(cfg.zerodevRpc),
-		paymaster: {
-			getPaymasterData: async (userOperation: Parameters<typeof paymaster.sponsorUserOperation>[0]["userOperation"]) => {
-				emit(telemetry, { phase: "sponsor", at: Date.now(), account: account.address });
-				try {
-					return await paymaster.sponsorUserOperation({ userOperation });
-				} catch (cause) {
-					throw new SponsorshipError(
-						"paymaster declined to sponsor the userOp — set/raise a ZeroDev gas policy on the Amoy project (no owner-pays fallback).",
-						{ cause },
-					);
-				}
+		zerodevRpc: cfg.zerodevRpc,
+		observability: {
+			onSponsor: ({ account }) => {
+				emit(telemetry, { phase: "sponsor", at: Date.now(), account });
+				params.onSponsorOutcome?.(false);
+			},
+			onSponsorError: ({ account }) => {
+				emit(telemetry, { phase: "sponsor_reject", at: Date.now(), account });
+				params.onSponsorOutcome?.(true);
 			},
 		},
-	}) as unknown as ConfiguredKernelClient;
-	return client;
+	});
 }
 
 export interface AgentPayIdentity {
@@ -176,7 +256,17 @@ export async function agentPay(params: {
 		envelope,
 		sessionKeySigner: params.sessionSigner,
 	});
-	const client = buildSponsoredKernelClient({ account, cfg, telemetry });
+	// Latest-wins (F4): reflects the LAST sponsor outcome, robust to getPaymasterData
+	// firing more than once per send. A genuine final decline → SponsorshipError below.
+	let sponsorDeclined = false;
+	const client = buildSponsoredKernelClient({
+		account,
+		cfg,
+		telemetry,
+		onSponsorOutcome: (declined) => {
+			sponsorDeclined = declined;
+		},
+	});
 
 	emit(telemetry, {
 		phase: "submit",
@@ -198,8 +288,18 @@ export async function agentPay(params: {
 		cache.set(key, result);
 		return { key, deduped: false, result };
 	} catch (err) {
-		// A policy violation reverts at userOp VALIDATION (simulation) — the transfer
-		// never executes, so the merchant balance is unchanged (the §8 discriminator).
+		// A paymaster decline (onSponsorOutcome(true) → sponsorDeclined) is NOT a policy
+		// rejection. The SDK helper re-throws the RAW paymaster error, so the harness
+		// re-establishes the typed SponsorshipError here (no owner-pays fallback) — the
+		// signal the §8 tests discriminate on.
+		if (sponsorDeclined) {
+			throw new SponsorshipError(
+				"paymaster declined to sponsor the userOp — set/raise a ZeroDev gas policy on the Amoy project (no owner-pays fallback).",
+				{ cause: err },
+			);
+		}
+		// Otherwise the userOp was rejected at VALIDATION (the permission validator) — the
+		// transfer never executed, so the merchant balance is unchanged (the §8 discriminator).
 		emit(telemetry, {
 			phase: "validation_reject",
 			at: Date.now(),
