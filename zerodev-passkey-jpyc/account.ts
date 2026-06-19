@@ -101,6 +101,42 @@ export async function buildPasskeyValidator(
 	});
 }
 
+/**
+ * RFC-0003 Cycle 2 — a passkey validator whose `signMessageCallback` THROWS, so a
+ * recoverable account can be built with its passkey sudo **provably unable to sign**.
+ * If a recovery flow reaches for the (lost) owner key, this surfaces it immediately;
+ * if recovery proceeds, it is provably passkey-independent. Address derivation needs
+ * only the public key, so the account address is identical to the live-passkey one.
+ */
+export async function buildLostPasskeyValidator(
+	publicClient: PublicClient<Transport, Chain>,
+	passkey: SoftwarePasskey,
+	rpID: string,
+) {
+	const entryPoint = getEntryPoint("0.7");
+	const authenticatorIdHash = keccak256(uint8ArrayToHexString(b64ToBytes(passkey.id)));
+	const webAuthnKey = await toWebAuthnKey({
+		webAuthnKey: {
+			pubX: passkey.publicKey.x,
+			pubY: passkey.publicKey.y,
+			authenticatorId: passkey.id,
+			authenticatorIdHash,
+			rpID,
+			signMessageCallback: () => {
+				throw new Error("passkey lost — recovery MUST NOT use the owner key");
+			},
+		},
+		rpID,
+		mode: WebAuthnMode.Login,
+	});
+	return toPasskeyValidator(publicClient, {
+		webAuthnKey,
+		entryPoint,
+		kernelVersion: KERNEL_V3_1,
+		validatorContractVersion: PasskeyValidatorContractVersion.V0_0_3_PATCHED,
+	});
+}
+
 /** Build a Kernel v0.7 account whose SUDO is the passkey validator, signing headless. */
 export async function createPasskeyAccount(params: {
 	readonly publicClient: PublicClient<Transport, Chain>;

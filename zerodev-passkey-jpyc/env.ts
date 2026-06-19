@@ -48,6 +48,18 @@ function requiredHex32(name: string): Hex {
 	return hex as Hex;
 }
 
+/** Like {@link requiredHex32} but returns undefined when unset — for RFC-0003 Cycle 2 guardians. */
+function optionalHex32(name: string): Hex | undefined {
+	const raw = process.env[name];
+	if (raw === undefined || raw.trim() === "") return undefined;
+	const v = raw.trim();
+	const hex = v.startsWith("0x") ? v : `0x${v}`;
+	if (!/^0x[0-9a-fA-F]{64}$/.test(hex)) {
+		throw new Error(`RFC-0003: env var ${name} must be a 32-byte hex private key.`);
+	}
+	return hex as Hex;
+}
+
 function optionalInt(name: string, fallback: number): number {
 	const v = process.env[name];
 	if (v === undefined || v.trim() === "") return fallback;
@@ -67,6 +79,10 @@ export interface RfcConfig {
 	/** WebAuthn relying-party id (the owner is a PASSKEY; there is no owner private key). */
 	readonly rpID: string;
 	readonly sessionPrivateKey: Hex;
+	/** Hub recovery guardian (ECDSA, weight 1) — RFC-0003 Cycle 2; undefined unless set. */
+	readonly hubGuardianKey: Hex | undefined;
+	/** User backup recovery guardian (ECDSA, weight 1) — RFC-0003 Cycle 2; undefined unless set. */
+	readonly userBackupKey: Hex | undefined;
 	readonly merchant: Address;
 	/** Human JPYC per-transfer cap (default 1). */
 	readonly maxPerTransferJpyc: number;
@@ -92,6 +108,8 @@ export function loadConfig(): RfcConfig {
 		jpycDecimals,
 		rpID: process.env.PASSKEY_RPID?.trim() || "kawasekit.local",
 		sessionPrivateKey: requiredHex32("SESSION_PRIVATE_KEY"),
+		hubGuardianKey: optionalHex32("HUB_GUARDIAN_PRIVATE_KEY"),
+		userBackupKey: optionalHex32("USER_BACKUP_PRIVATE_KEY"),
 		merchant: requiredAddress("MERCHANT_ADDRESS"),
 		maxPerTransferJpyc: optionalInt("MAX_PER_TRANSFER_JPYC", 1),
 		maxTransfers: optionalInt("MAX_TRANSFERS", 1),
@@ -141,6 +159,23 @@ export async function assertJpycOnChain(
 /** Derive the session viem account (the owner is a passkey — see {@link loadOrCreatePasskey}). */
 export function sessionFromConfig(cfg: RfcConfig): ReturnType<typeof privateKeyToAccount> {
 	return privateKeyToAccount(cfg.sessionPrivateKey);
+}
+
+/**
+ * The two ECDSA recovery guardians (Hub + user backup) — RFC-0003 Cycle 2. Each gets
+ * weight 1; threshold 2 (Hub alone < threshold → cannot rotate the owner). Throws if the
+ * guardian keys are unset (recovery requires them; the rest of the harness does not).
+ */
+export function guardiansFromConfig(cfg: RfcConfig): {
+	readonly hub: ReturnType<typeof privateKeyToAccount>;
+	readonly userBackup: ReturnType<typeof privateKeyToAccount>;
+} {
+	if (cfg.hubGuardianKey === undefined || cfg.userBackupKey === undefined) {
+		throw new Error(
+			"RFC-0003 Cycle 2: HUB_GUARDIAN_PRIVATE_KEY and USER_BACKUP_PRIVATE_KEY must be set for recovery.",
+		);
+	}
+	return { hub: privateKeyToAccount(cfg.hubGuardianKey), userBackup: privateKeyToAccount(cfg.userBackupKey) };
 }
 
 /**

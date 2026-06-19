@@ -17,6 +17,7 @@
     "test:rfc0001": "vitest run zerodev-agent-jpyc",
     "test:rfc0003": "vitest run zerodev-passkey-jpyc",
     "passkey:p1": "tsx zerodev-passkey-jpyc/probe-passkey.ts",
+    "recovery:probe": "tsx zerodev-passkey-jpyc/probe-recovery.ts",
     "typecheck": "tsc --noEmit",
     "typecheck:rfc0001": "tsc --noEmit -p zerodev-agent-jpyc/tsconfig.json",
     "typecheck:rfc0003": "tsc --noEmit -p zerodev-passkey-jpyc/tsconfig.json"
@@ -28,6 +29,7 @@
     "@zerodev/permissions": "5.5.14",
     "@zerodev/sdk": "5.5.10",
     "@zerodev/webauthn-key": "^5.5.0",
+    "@zerodev/weighted-ecdsa-validator": "5.4.1",
     "dotenv": "17.4.2",
     "hono": "4.12.22",
     "kawasekit": "^0.8.0",
