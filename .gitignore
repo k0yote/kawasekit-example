@@ -14,3 +14,7 @@ pnpm-workspace.yaml
 
 # RFC-0003 Cycle 1 — persisted software passkey (testnet only, never commit)
 zerodev-passkey-jpyc/.passkey-cycle1.json
+# RFC-0003 Cycle 2 — persisted recovery passkeys (the new owner + the dedicated R2 + probe accounts)
+zerodev-passkey-jpyc/.passkey-recovered.json
+zerodev-passkey-jpyc/.passkey-r2.json
+zerodev-passkey-jpyc/.passkey-recovery-probe.json

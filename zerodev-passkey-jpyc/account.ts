@@ -68,6 +68,27 @@ export function passkeySignMessageCallback(passkey: SoftwarePasskey) {
 }
 
 /**
+ * Build the headless `WebAuthnKey` for a software passkey (no passkey-server fetch) — the
+ * shared primitive behind both the passkey validator (Cycle 1) and a weighted-validator
+ * passkey signer (Cycle 2 Approach B). `signMessageCallback` is the same headless ox seam.
+ */
+export async function webAuthnKeyForPasskey(passkey: SoftwarePasskey, rpID: string) {
+	const authenticatorIdHash = keccak256(uint8ArrayToHexString(b64ToBytes(passkey.id)));
+	return toWebAuthnKey({
+		webAuthnKey: {
+			pubX: passkey.publicKey.x,
+			pubY: passkey.publicKey.y,
+			authenticatorId: passkey.id,
+			authenticatorIdHash,
+			rpID,
+			signMessageCallback: passkeySignMessageCallback(passkey),
+		},
+		rpID,
+		mode: WebAuthnMode.Login,
+	});
+}
+
+/**
  * Build the passkey **validator** (reusable as a Kernel sudo). Factored out so both
  * the P1 owner-only account and the P2 session-key account (sudo = passkey, regular =
  * permission validator) can root on the same headless passkey.
@@ -78,9 +99,29 @@ export async function buildPasskeyValidator(
 	rpID: string,
 ) {
 	const entryPoint = getEntryPoint("0.7");
-	// authenticatorIdHash exactly as @zerodev derives it (keccak256 of the raw credential bytes).
+	const webAuthnKey = await webAuthnKeyForPasskey(passkey, rpID);
+	return toPasskeyValidator(publicClient, {
+		webAuthnKey,
+		entryPoint,
+		kernelVersion: KERNEL_V3_1,
+		validatorContractVersion: PasskeyValidatorContractVersion.V0_0_3_PATCHED,
+	});
+}
+
+/**
+ * RFC-0003 Cycle 2 — a passkey validator whose `signMessageCallback` THROWS, so a
+ * recoverable account can be built with its passkey sudo **provably unable to sign**.
+ * If a recovery flow reaches for the (lost) owner key, this surfaces it immediately;
+ * if recovery proceeds, it is provably passkey-independent. Address derivation needs
+ * only the public key, so the account address is identical to the live-passkey one.
+ */
+export async function buildLostPasskeyValidator(
+	publicClient: PublicClient<Transport, Chain>,
+	passkey: SoftwarePasskey,
+	rpID: string,
+) {
+	const entryPoint = getEntryPoint("0.7");
 	const authenticatorIdHash = keccak256(uint8ArrayToHexString(b64ToBytes(passkey.id)));
-	// Passing a complete webAuthnKey makes toWebAuthnKey return it as-is (no passkey-server fetch).
 	const webAuthnKey = await toWebAuthnKey({
 		webAuthnKey: {
 			pubX: passkey.publicKey.x,
@@ -88,7 +129,9 @@ export async function buildPasskeyValidator(
 			authenticatorId: passkey.id,
 			authenticatorIdHash,
 			rpID,
-			signMessageCallback: passkeySignMessageCallback(passkey),
+			signMessageCallback: () => {
+				throw new Error("passkey lost — recovery MUST NOT use the owner key");
+			},
 		},
 		rpID,
 		mode: WebAuthnMode.Login,
