@@ -68,20 +68,13 @@ export function passkeySignMessageCallback(passkey: SoftwarePasskey) {
 }
 
 /**
- * Build the passkey **validator** (reusable as a Kernel sudo). Factored out so both
- * the P1 owner-only account and the P2 session-key account (sudo = passkey, regular =
- * permission validator) can root on the same headless passkey.
+ * Build the headless `WebAuthnKey` for a software passkey (no passkey-server fetch) — the
+ * shared primitive behind both the passkey validator (Cycle 1) and a weighted-validator
+ * passkey signer (Cycle 2 Approach B). `signMessageCallback` is the same headless ox seam.
  */
-export async function buildPasskeyValidator(
-	publicClient: PublicClient<Transport, Chain>,
-	passkey: SoftwarePasskey,
-	rpID: string,
-) {
-	const entryPoint = getEntryPoint("0.7");
-	// authenticatorIdHash exactly as @zerodev derives it (keccak256 of the raw credential bytes).
+export async function webAuthnKeyForPasskey(passkey: SoftwarePasskey, rpID: string) {
 	const authenticatorIdHash = keccak256(uint8ArrayToHexString(b64ToBytes(passkey.id)));
-	// Passing a complete webAuthnKey makes toWebAuthnKey return it as-is (no passkey-server fetch).
-	const webAuthnKey = await toWebAuthnKey({
+	return toWebAuthnKey({
 		webAuthnKey: {
 			pubX: passkey.publicKey.x,
 			pubY: passkey.publicKey.y,
@@ -93,6 +86,20 @@ export async function buildPasskeyValidator(
 		rpID,
 		mode: WebAuthnMode.Login,
 	});
+}
+
+/**
+ * Build the passkey **validator** (reusable as a Kernel sudo). Factored out so both
+ * the P1 owner-only account and the P2 session-key account (sudo = passkey, regular =
+ * permission validator) can root on the same headless passkey.
+ */
+export async function buildPasskeyValidator(
+	publicClient: PublicClient<Transport, Chain>,
+	passkey: SoftwarePasskey,
+	rpID: string,
+) {
+	const entryPoint = getEntryPoint("0.7");
+	const webAuthnKey = await webAuthnKeyForPasskey(passkey, rpID);
 	return toPasskeyValidator(publicClient, {
 		webAuthnKey,
 		entryPoint,

@@ -1,145 +1,167 @@
 /**
- * RFC-0003 Cycle 2 foundation spike — AA23 isolation diagnostic (v2).
+ * RFC-0003 Cycle 2 — Approach B RECOVERY GATE (the prerequisite for the foundation revision).
  *
  *   pnpm recovery:probe
  *
- * The combined deploy + enable-guardian + doRecovery userOp reverts in validation. This
- * isolates the cause with a CONTROL and a single-variable split, printing the full revert
- * reason (the previous run truncated it). All single-guardian (the proven example shape),
- * owner present, sponsored, ephemeral accounts — we are finding WHY validation reverts.
+ * Confirms on Amoy that B's recovery works: the account's sudo is ONE weighted validator
+ * [passkey-A (100), Hub (50), backup (50)], threshold 100. Recovery = the GUARDIANS ALONE
+ * (Hub+backup = 100, passkey-A absent) reset the validator config to a NEW passkey-B, and
+ * the new passkey then controls the account.
  *
- *   A (CONTROL) ECDSA sudo → ECDSA target  = ZeroDev's proven example, on OUR Amoy setup.
- *                                            MUST pass, else the problem is environmental
- *                                            (RPC / paymaster / recovery-action-on-Amoy),
- *                                            not passkey-specific.
- *   B           passkey sudo → ECDSA target = can a passkey be the ENABLING ROOT + rotate?
- *   C           passkey sudo → passkey target = the real design (passkey re-init, U4).
+ *   R1  deploy the weighted-sudo account (guardians sign; recovery action installed)
+ *   R2  guardians-only doRecovery → reset config to [passkey-B (100), Hub, backup]
+ *   R3  passkey-B alone (weight 100) signs → it is the new owner; SAME address (R4a)
+ *
+ * PASS = B's non-custodial recovery is real on Amoy, keeping a passkey owner. Sponsored,
+ * ephemeral. Non-custodial caveat to record honestly in RFC §6.5: Hub+backup together hold
+ * FULL owner power (not recovery-only) — but the user (backup) is required, so Hub alone
+ * (50 < 100) cannot act.
  */
 import "dotenv/config";
 
-import { getValidatorAddress as getEcdsaValidatorAddress, signerToEcdsaValidator } from "@zerodev/ecdsa-validator";
-import { getValidatorAddress as getPasskeyValidatorAddress, PasskeyValidatorContractVersion } from "@zerodev/passkey-validator";
-import { createKernelAccount, type CreateKernelAccountReturnType } from "@zerodev/sdk";
+import { createKernelAccount, createZeroDevPaymasterClient } from "@zerodev/sdk";
 import { getEntryPoint, KERNEL_V3_1 } from "@zerodev/sdk/constants";
-import { createWeightedECDSAValidator, getRecoveryAction } from "@zerodev/weighted-ecdsa-validator";
-import { type Address, encodeFunctionData, type Hex, parseAbi } from "viem";
-import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { buildPasskeyValidator } from "./account.ts";
-import { loadConfig, makePublicClient, type RfcConfig } from "./env.ts";
-import { buildSponsoredKernelClient } from "./harness.ts";
+import {
+	createWeightedKernelAccountClient,
+	createWeightedValidator,
+	getRecoveryFallbackActionInstallModuleData,
+	getValidatorAddress as getWeightedValidatorAddress,
+	toECDSASigner,
+	toWebAuthnSigner,
+	type WeightedSigner,
+	WeightedValidatorContractVersion,
+} from "@zerodev/weighted-validator";
+import { type Address, encodeFunctionData, type Hex, http, parseAbi, zeroAddress } from "viem";
+import { webAuthnKeyForPasskey } from "./account.ts";
+import { guardiansFromConfig, loadConfig, makePublicClient, type RfcConfig } from "./env.ts";
 import { createSoftwarePasskey } from "./passkey.ts";
 
 const entryPoint = getEntryPoint("0.7");
+const WV = WeightedValidatorContractVersion.V0_0_2_PATCHED;
 const RECOVERY_FN = "function doRecovery(address _validator, bytes calldata _data)" as const;
 
-// One throwaway guardian EOA for all stages (we need its key to sign; the env Hub address
-// would do for config, but the diagnostic holds the key to keep it self-contained).
-const GUARDIAN_KEY = generatePrivateKey();
-
-/** Surface the on-chain revert reason (AA-code) instead of the generic HTTP wrapper. */
-function detail(e: unknown): string {
-	if (!(e instanceof Error)) return String(e);
-	const m = e.message;
-	const reason = m.match(/reason:\s*([^\n"]+)/)?.[1] ?? m.match(/Details:\s*([^\n]+)/)?.[1];
-	return (reason ?? m.split("\n").slice(0, 4).join(" | ")).trim();
-}
-
-async function attempt(
-	label: string,
-	a: {
-		readonly publicClient: ReturnType<typeof makePublicClient>;
-		readonly cfg: RfcConfig;
-		// biome-ignore lint/suspicious/noExplicitAny: ZeroDev validator union is internal; this is a throwaway diagnostic.
-		readonly sudoValidator: any;
-		readonly guardian: Address;
-		readonly targetValidator: Address;
-		readonly targetData: Hex;
-	},
-): Promise<boolean> {
-	try {
-		const guardianValidator = await createWeightedECDSAValidator(a.publicClient, {
-			entryPoint,
-			kernelVersion: KERNEL_V3_1,
-			config: { threshold: 1, signers: [{ address: a.guardian, weight: 1 }] },
-			signers: [privateKeyToAccount(GUARDIAN_KEY)],
-		});
-		const account = (await createKernelAccount(a.publicClient, {
-			entryPoint,
-			kernelVersion: KERNEL_V3_1,
-			plugins: { sudo: a.sudoValidator, regular: guardianValidator, action: getRecoveryAction(entryPoint.version) },
-		})) as CreateKernelAccountReturnType<"0.7">;
-		const client = buildSponsoredKernelClient({ account, cfg: a.cfg });
-		const callData = encodeFunctionData({
-			abi: parseAbi([RECOVERY_FN]),
-			functionName: "doRecovery",
-			args: [a.targetValidator, a.targetData],
-		});
-		const hash = await client.sendUserOperation({ callData });
-		const receipt = await client.waitForUserOperationReceipt({ hash });
-		console.log(`✅ ${label}: PASS — ${receipt.receipt.transactionHash}`);
-		return true;
-	} catch (e) {
-		console.log(`❌ ${label}: ${detail(e)}`);
-		return false;
-	}
-}
+// biome-ignore lint/suspicious/noExplicitAny: weighted config signer/publicKey union is internal.
+type WConfig = { threshold: number; signers: { publicKey: any; weight: number }[] };
 
 async function main(): Promise<void> {
-	const cfg = loadConfig();
+	const cfg: RfcConfig = loadConfig();
 	const publicClient = makePublicClient(cfg);
-	const guardian = privateKeyToAccount(GUARDIAN_KEY);
+	const { hub, userBackup } = guardiansFromConfig(cfg);
+	const paymaster = createZeroDevPaymasterClient({ chain: cfg.chain, transport: http(cfg.zerodevRpc) });
+	const weightedAddr = getWeightedValidatorAddress(entryPoint.version, WV);
 
-	console.log("RFC-0003 Cycle 2 — AA23 isolation diagnostic v2 (full revert reasons)\n");
+	const hubSigner = await toECDSASigner({ signer: hub });
+	const backupSigner = await toECDSASigner({ signer: userBackup });
 
-	// Common targets.
-	const newEcdsa = privateKeyToAccount(generatePrivateKey());
-	const ecdsaTargetValidator = getEcdsaValidatorAddress(entryPoint, KERNEL_V3_1);
-	const newPasskey = createSoftwarePasskey();
-	const passkeyTargetValidator = getPasskeyValidatorAddress(entryPoint, KERNEL_V3_1, PasskeyValidatorContractVersion.V0_0_3_PATCHED);
-	const passkeyTargetData = await (await buildPasskeyValidator(publicClient, newPasskey, cfg.rpID)).getEnableData();
+	const passkeyA = createSoftwarePasskey();
+	const webAuthnKeyA = await webAuthnKeyForPasskey(passkeyA, cfg.rpID);
+	const initialConfig: WConfig = {
+		threshold: 100,
+		signers: [
+			{ publicKey: webAuthnKeyA, weight: 100 },
+			{ publicKey: hub.address, weight: 50 },
+			{ publicKey: userBackup.address, weight: 50 },
+		],
+	};
 
-	// A — CONTROL: ECDSA sudo → ECDSA target (the proven example).
-	const oldEcdsa = privateKeyToAccount(generatePrivateKey());
-	const ecdsaSudo = await signerToEcdsaValidator(publicClient, { signer: oldEcdsa, entryPoint, kernelVersion: KERNEL_V3_1 });
-	const a = await attempt("A control  ECDSA→ECDSA ", {
-		publicClient,
-		cfg,
-		sudoValidator: ecdsaSudo,
-		guardian: guardian.address,
-		targetValidator: ecdsaTargetValidator,
-		targetData: newEcdsa.address,
+	const clientFor = async (config: WConfig, signer: WeightedSigner, address?: Address) => {
+		const v = await createWeightedValidator(publicClient, {
+			entryPoint,
+			kernelVersion: KERNEL_V3_1,
+			validatorContractVersion: WV,
+			signer,
+			config,
+		});
+		const account = await createKernelAccount(publicClient, {
+			entryPoint,
+			kernelVersion: KERNEL_V3_1,
+			...(address !== undefined ? { address } : {}),
+			plugins: { sudo: v },
+			// The new package installs the recovery executor (+ its hook) as a FALLBACK module
+			// via a plugin migration — NOT via plugins.action (that left the doRecovery selector
+			// unregistered → InvalidSelector). The migration runs on the first userOp (R1 deploy).
+			pluginMigrations: [getRecoveryFallbackActionInstallModuleData(entryPoint.version)],
+		});
+		return createWeightedKernelAccountClient({ account, chain: cfg.chain, bundlerTransport: http(cfg.zerodevRpc), paymaster });
+	};
+
+	const hubClient = await clientFor(initialConfig, hubSigner);
+	const backupClient = await clientFor(initialConfig, backupSigner);
+	const deployedAddress = hubClient.account.address;
+
+	console.log("RFC-0003 Cycle 2 — Approach B recovery gate (@zerodev/weighted-validator)\n");
+	console.log(`  weighted-sudo account: ${deployedAddress}`);
+	console.log(`  initial owner: passkey-A (w100) + guardians hub/backup (w50 each, thr 100)\n`);
+
+	const noop = await hubClient.account.encodeCalls([{ to: zeroAddress, value: 0n, data: "0x" }]);
+
+	// 2-of-2 (Hub + backup) send a callData via the approve/aggregate flow.
+	const guardians2of2 = async (label: string, callData: Hex): Promise<boolean> => {
+		try {
+			const s1 = await hubClient.approveUserOperation({ callData, validatorContractVersion: WV });
+			const s2 = await backupClient.approveUserOperation({ callData, validatorContractVersion: WV });
+			const hash = await backupClient.sendUserOperationWithSignatures({ callData, signatures: [s1, s2] });
+			const r = await backupClient.waitForUserOperationReceipt({ hash });
+			console.log(`✅ ${label}: ${r.receipt.transactionHash}`);
+			return true;
+		} catch (e) {
+			console.log(`❌ ${label}: ${e instanceof Error ? e.message.split("\n").slice(0, 3).join(" | ") : String(e)}`);
+			return false;
+		}
+	};
+
+	// R1 — deploy the weighted-sudo account (guardians meet threshold; installs recovery action).
+	if (!(await guardians2of2("R1 deploy weighted-sudo account (guardians)", noop))) return done(false);
+
+	// R2 — guardians-only doRecovery → reset config to a NEW passkey-B (passkey-A is "lost").
+	const passkeyB = createSoftwarePasskey();
+	const webAuthnKeyB = await webAuthnKeyForPasskey(passkeyB, cfg.rpID);
+	const newConfig: WConfig = {
+		threshold: 100,
+		signers: [
+			{ publicKey: webAuthnKeyB, weight: 100 },
+			{ publicKey: hub.address, weight: 50 },
+			{ publicKey: userBackup.address, weight: 50 },
+		],
+	};
+	const newWeighted = await createWeightedValidator(publicClient, {
+		entryPoint,
+		kernelVersion: KERNEL_V3_1,
+		validatorContractVersion: WV,
+		signer: hubSigner,
+		config: newConfig,
 	});
-
-	// B — passkey sudo → ECDSA target (isolate the passkey ENABLING ROOT).
-	const passkey = createSoftwarePasskey();
-	const passkeySudoB = await buildPasskeyValidator(publicClient, passkey, cfg.rpID);
-	const b = await attempt("B          passkey→ECDSA", {
-		publicClient,
-		cfg,
-		sudoValidator: passkeySudoB,
-		guardian: guardian.address,
-		targetValidator: ecdsaTargetValidator,
-		targetData: newEcdsa.address,
+	const newData = await newWeighted.getEnableData();
+	const doRecoveryCallData = encodeFunctionData({
+		abi: parseAbi([RECOVERY_FN]),
+		functionName: "doRecovery",
+		args: [weightedAddr, newData],
 	});
+	if (!(await guardians2of2("R2 guardians-only doRecovery → reset config to passkey-B", doRecoveryCallData))) return done(false);
 
-	// C — passkey sudo → passkey target (the real design; passkey re-init / U4).
-	const passkeyC = createSoftwarePasskey();
-	const passkeySudoC = await buildPasskeyValidator(publicClient, passkeyC, cfg.rpID);
-	const c = await attempt("C          passkey→passkey", {
-		publicClient,
-		cfg,
-		sudoValidator: passkeySudoC,
-		guardian: guardian.address,
-		targetValidator: passkeyTargetValidator,
-		targetData: passkeyTargetData,
-	});
+	// R3 — the NEW passkey-B (weight 100) signs ALONE at the SAME address (R4a address invariant).
+	try {
+		const passkeyBSigner = await toWebAuthnSigner(publicClient, { webAuthnKey: webAuthnKeyB });
+		const bClient = await clientFor(newConfig, passkeyBSigner, deployedAddress);
+		const bNoop = await bClient.account.encodeCalls([{ to: zeroAddress, value: 0n, data: "0x" }]);
+		const s = await bClient.approveUserOperation({ callData: bNoop, validatorContractVersion: WV });
+		const hash = await bClient.sendUserOperationWithSignatures({ callData: bNoop, signatures: [s] });
+		const r = await bClient.waitForUserOperationReceipt({ hash });
+		console.log(`✅ R3 new passkey-B signs alone (w100) @ same address: ${r.receipt.transactionHash}`);
+	} catch (e) {
+		console.log(`❌ R3 new passkey-B signs: ${e instanceof Error ? e.message.split("\n").slice(0, 3).join(" | ") : String(e)}`);
+		return done(false);
+	}
+	done(true);
+}
 
-	console.log("\n--- diagnosis ---");
-	if (!a) console.log("A (control) FAILED → environmental, not passkey: RPC/paymaster/recovery-action on Amoy. Fix that first.");
-	else if (a && !b) console.log("A passes, B fails → a PASSKEY cannot be the enabling root for the guardian (enable-mode). Deeper design issue.");
-	else if (a && b && !c) console.log("A+B pass, C fails → passkey-as-root works; the PASSKEY RE-INIT target (U4) is unsupported by doRecovery. Rotate to a fresh ECDSA or find a passkey change-pubkey path.");
-	else if (a && b && c) console.log("All pass → the original 2-of-2 combined op was the issue (U2 aggregation). Revisit the 2-of-2 signing.");
-	console.log(`(guardian used: ${guardian.address})`);
+function done(ok: boolean): void {
+	console.log("\n--- gate ---");
+	console.log(
+		ok
+			? "✅ GATE PASSED — guardians-only config-reset to a new passkey works on Amoy, and the new passkey owns the account at the same address. → proceed to revise RFC §6.2–6.5 to Approach B."
+			: "❌ GATE NOT PASSED — read the failing step above. Do NOT revise the foundation until R1–R3 are green.",
+	);
 }
 
 main().catch((e: unknown) => {

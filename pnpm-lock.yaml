@@ -29,6 +29,9 @@ importers:
       '@zerodev/weighted-ecdsa-validator':
         specifier: 5.4.1
         version: 5.4.1(@zerodev/sdk@5.5.10(viem@2.50.4(typescript@6.0.3)))(viem@2.50.4(typescript@6.0.3))
+      '@zerodev/weighted-validator':
+        specifier: ^5.5.1
+        version: 5.5.1(@zerodev/sdk@5.5.10(viem@2.50.4(typescript@6.0.3)))(@zerodev/webauthn-key@5.5.0(viem@2.50.4(typescript@6.0.3)))(viem@2.50.4(typescript@6.0.3))
       dotenv:
         specifier: 17.4.2
         version: 17.4.2
@@ -488,6 +491,13 @@ packages:
     peerDependencies:
       '@zerodev/sdk': ^5.4.0
       viem: ^2.21.40
+
+  '@zerodev/weighted-validator@5.5.1':
+    resolution: {integrity: sha512-fQhlI3OZNm0ONFeMJKqV72G/oXUX6D/7wmofgSBSEVvzummvjwVj3iSj1cz/sht5AfaZVteWnX8eIQLutJwTaQ==}
+    peerDependencies:
+      '@zerodev/sdk': ^5.4.0
+      '@zerodev/webauthn-key': ^5.4.2
+      viem: ^2.28.0
 
   abitype@1.2.3:
     resolution: {integrity: sha512-Ofer5QUnuUdTFsBRwARMoWKOH1ND5ehwYhJ3OJ/BQO+StkwQjHw0XyVh4vDttzHB7QOFhPHa/o413PJ82gU/Tg==}
@@ -1243,6 +1253,14 @@ snapshots:
   '@zerodev/weighted-ecdsa-validator@5.4.1(@zerodev/sdk@5.5.10(viem@2.50.4(typescript@6.0.3)))(viem@2.50.4(typescript@6.0.3))':
     dependencies:
       '@zerodev/sdk': 5.5.10(viem@2.50.4(typescript@6.0.3))
+      viem: 2.50.4(typescript@6.0.3)
+
+  '@zerodev/weighted-validator@5.5.1(@zerodev/sdk@5.5.10(viem@2.50.4(typescript@6.0.3)))(@zerodev/webauthn-key@5.5.0(viem@2.50.4(typescript@6.0.3)))(viem@2.50.4(typescript@6.0.3))':
+    dependencies:
+      '@noble/curves': 1.9.7
+      '@simplewebauthn/browser': 8.3.7
+      '@zerodev/sdk': 5.5.10(viem@2.50.4(typescript@6.0.3))
+      '@zerodev/webauthn-key': 5.5.0(viem@2.50.4(typescript@6.0.3))
       viem: 2.50.4(typescript@6.0.3)
 
   abitype@1.2.3(typescript@6.0.3):
