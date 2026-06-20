@@ -12,10 +12,10 @@
  * passkey-capable kawasekit issuance helper is the Cycle-1 follow-up.
  */
 
-import { serializePermissionAccount, toPermissionValidator } from "@zerodev/permissions";
+import { type Policy, serializePermissionAccount, toPermissionValidator } from "@zerodev/permissions";
 import { toECDSASigner } from "@zerodev/permissions/signers";
 import { type CreateKernelAccountReturnType, createKernelAccount, createKernelAccountClient } from "@zerodev/sdk";
-import { getEntryPoint, KERNEL_V3_1 } from "@zerodev/sdk/constants";
+import { getEntryPoint, KERNEL_V3_1, VALIDATOR_TYPE } from "@zerodev/sdk/constants";
 import {
 	type ConfiguredKernelClient,
 	createBuyListPolicies,
@@ -32,15 +32,28 @@ import {
 import {
 	type Address,
 	type Chain,
+	concatHex,
+	encodeFunctionData,
 	formatUnits,
+	type Hex,
 	http,
 	type LocalAccount,
+	pad,
+	parseAbi,
 	parseUnits,
 	type PublicClient,
 	type Transport,
 } from "viem";
 import { buildPasskeyValidator } from "./account.ts";
 import { AMOY_CHAIN_ID, type RfcConfig } from "./env.ts";
+import {
+	approveSessionKeyEnable,
+	buildOwnerSudoValidator,
+	ownerConfig,
+	passkeyOwnerSigner,
+	sendWeighted,
+	weightedClientFor,
+} from "./weighted-account.ts";
 import { SponsorshipError } from "./errors.ts";
 import { emit, type HarnessTelemetry } from "./observability.ts";
 import type { SoftwarePasskey } from "./passkey.ts";
@@ -77,6 +90,22 @@ export function buildBuyList(cfg: RfcConfig, o: BuyListOverrides = {}): Resolved
 }
 
 /**
+ * The buy-list permission policy set. Shared by issuance AND revocation so both derive the
+ * SAME permission-validator identifier — the validator id is a function of (session signer +
+ * policies), so revoke (R4c) MUST rebuild it from the identical buy-list it was issued with.
+ */
+function buyListPolicies(cfg: RfcConfig, buyList: ResolvedBuyList) {
+	return createBuyListPolicies({
+		jpycAddress: cfg.jpycAddress,
+		merchants: buyList.merchants,
+		maxPerTransfer: buyList.maxPerTransfer,
+		maxTransfers: buyList.maxTransfers,
+		validUntil: buyList.validUntil,
+		...(buyList.validAfter !== undefined ? { validAfter: buyList.validAfter } : {}),
+	});
+}
+
+/**
  * OWNER side (PASSKEY) — bake the buy-list into a disposable session key under the
  * PASSKEY sudo, and hand the agent the serialized approval. Built RAW because
  * kawasekit's `issueSessionKey` is ECDSA-only (it can't take a passkey sudo): sudo =
@@ -93,14 +122,7 @@ export async function issuePasskeyScopedSessionKey(params: {
 }): Promise<string> {
 	const { cfg, publicClient, passkey, sessionSigner, buyList } = params;
 	const entryPoint = getEntryPoint("0.7");
-	const policies = createBuyListPolicies({
-		jpycAddress: cfg.jpycAddress,
-		merchants: buyList.merchants,
-		maxPerTransfer: buyList.maxPerTransfer,
-		maxTransfers: buyList.maxTransfers,
-		validUntil: buyList.validUntil,
-		...(buyList.validAfter !== undefined ? { validAfter: buyList.validAfter } : {}),
-	});
+	const policies = buyListPolicies(cfg, buyList);
 	const sudoValidator = await buildPasskeyValidator(publicClient, passkey, cfg.rpID);
 	const sessionModularSigner = await toECDSASigner({ signer: sessionSigner });
 	const permissionValidator = await toPermissionValidator(publicClient, {
@@ -123,6 +145,136 @@ export async function issuePasskeyScopedSessionKey(params: {
 		serialized,
 		expiresAt: BigInt(buyList.validUntil),
 	});
+}
+
+/**
+ * RFC-0003 Cycle 2 (Approach B) — issue the buy-list session key UNDER THE WEIGHTED SUDO.
+ * The owner is the weighted validator [passkey 100, Hub 50, backup 50, threshold 100]; the
+ * passkey alone (weight 100) enables the regular permission validator. The agent side
+ * (`restoreSessionAccount` + `agentPay`) is unchanged from Cycle 1.
+ *
+ * **C1-revalidate (the front-loaded risk):** whether `serializePermissionAccount` round-trips
+ * a WEIGHTED sudo is proven by the live run. If it cannot, the fallback is an explicit
+ * `installModule` of the permission validator via the passkey-owner weighted client.
+ */
+export async function issueSessionKeyUnderWeightedSudo(params: {
+	readonly cfg: RfcConfig;
+	readonly publicClient: PublicClient<Transport, Chain>;
+	readonly passkey: SoftwarePasskey;
+	readonly hub: Address;
+	readonly backup: Address;
+	readonly sessionSigner: LocalAccount;
+	readonly buyList: ResolvedBuyList;
+	/** Bind issuance to an existing deployed account (R4b: the recovered account, new owner). */
+	readonly address?: Address;
+}): Promise<string> {
+	const { cfg, publicClient, passkey, hub, backup, sessionSigner, buyList } = params;
+	const entryPoint = getEntryPoint("0.7");
+	const policies = buyListPolicies(cfg, buyList);
+	const sudoValidator = await buildOwnerSudoValidator(publicClient, passkey, cfg.rpID, hub, backup);
+	const sessionModularSigner = await toECDSASigner({ signer: sessionSigner });
+	const permissionValidator = await toPermissionValidator(publicClient, {
+		signer: sessionModularSigner,
+		policies: [...policies],
+		entryPoint,
+		kernelVersion: KERNEL_V3_1,
+	});
+	// Under a WEIGHTED sudo, the enable signature must be the weighted approval (approvePlugin +
+	// encodeSignatures) — the default single-signer enable fails on-chain (EnableNotApproved).
+	const enableSignature = await approveSessionKeyEnable(publicClient, cfg, passkey, hub, backup, permissionValidator, params.address);
+	const account = await createKernelAccount(publicClient, {
+		plugins: { sudo: sudoValidator, regular: permissionValidator },
+		entryPoint,
+		kernelVersion: KERNEL_V3_1,
+		...(params.address !== undefined ? { address: params.address } : {}),
+	});
+	const serialized = await serializePermissionAccount(account, undefined, enableSignature);
+	return serializeSessionEnvelope({
+		kawasekitVersion: KAWASEKIT_SESSION_ENVELOPE_VERSION,
+		chainId: AMOY_CHAIN_ID,
+		smartAccountAddress: account.address,
+		sessionKeyAddress: sessionSigner.address,
+		serialized,
+		expiresAt: BigInt(buyList.validUntil),
+	});
+}
+
+/** `uninstallValidation` on the Kernel v3.1 account — removes a validation (session key). */
+const UNINSTALL_VALIDATION_ABI = parseAbi([
+	"function uninstallValidation(bytes21 vId, bytes deinitData, bytes hookDeinitData)",
+]);
+
+/**
+ * The inner `uninstallValidation(vId, deinitData, hookData)` call that removes a session-key
+ * permission validator. A byte-faithful reproduction of `@zerodev/sdk`'s `uninstallPlugin`
+ * action (`node_modules/@zerodev/sdk/_esm/actions/account-client/uninstallPlugin.js`): we
+ * cannot call `uninstallPlugin(client, …)` directly because it hardcodes the single-signer
+ * `sendUserOperation` path the WEIGHTED validator rejects (it needs the approve/aggregate
+ * `sendWeighted` flow). The plugin is rebuilt from the SAME session signer + SAME policies
+ * installed at issue time, so `getIdentifier()` + `getEnableData()` reproduce the on-chain
+ * validation id exactly (a mismatch would revert at `uninstallValidation`).
+ */
+export async function uninstallSessionKeyData(params: {
+	readonly publicClient: PublicClient<Transport, Chain>;
+	readonly sessionSigner: LocalAccount;
+	/** The SAME policy set installed at issue (rebuild via `buyListPolicies` / `createBuyListPolicies`). */
+	readonly policies: readonly Policy[];
+	readonly accountAddress: Address;
+}): Promise<Hex> {
+	const { publicClient, sessionSigner } = params;
+	const entryPoint = getEntryPoint("0.7");
+	const sessionModularSigner = await toECDSASigner({ signer: sessionSigner });
+	const plugin = await toPermissionValidator(publicClient, {
+		signer: sessionModularSigner,
+		policies: [...params.policies],
+		entryPoint,
+		kernelVersion: KERNEL_V3_1,
+	});
+	// validatorId = VALIDATOR_TYPE.PERMISSION ‖ getIdentifier() right-padded to 20 bytes (= bytes21).
+	const validatorId = concatHex([VALIDATOR_TYPE.PERMISSION, pad(plugin.getIdentifier(), { size: 20, dir: "right" })]);
+	const deinitData = await plugin.getEnableData(params.accountAddress);
+	return encodeFunctionData({
+		abi: UNINSTALL_VALIDATION_ABI,
+		functionName: "uninstallValidation",
+		args: [validatorId, deinitData, "0x"],
+	});
+}
+
+/**
+ * RFC-0003 Cycle 2 (Approach B) R4c — the NEW owner revokes the OLD session key. The passkey
+ * owner (weight 100 ≥ threshold) submits `uninstallValidation` through the weighted approve/
+ * aggregate flow ({@link sendWeighted}); after it lands the session key can no longer pass
+ * validation. Stale delegations survive a root rotation (regular validators persist across
+ * recovery in Kernel v3.1) — they must be revoked explicitly. Pass the SAME `sessionSigner` +
+ * `buyList` the key was issued with, and the deployed account `address`.
+ */
+export async function revokeSessionKeyUnderWeightedSudo(params: {
+	readonly cfg: RfcConfig;
+	readonly publicClient: PublicClient<Transport, Chain>;
+	readonly passkey: SoftwarePasskey;
+	readonly hub: Address;
+	readonly backup: Address;
+	readonly sessionSigner: LocalAccount;
+	readonly buyList: ResolvedBuyList;
+	readonly address: Address;
+}): Promise<{ readonly transactionHash: Hex | null }> {
+	const { cfg, publicClient, passkey, hub, backup, sessionSigner, buyList, address } = params;
+	const innerData = await uninstallSessionKeyData({
+		publicClient,
+		sessionSigner,
+		policies: [...buyListPolicies(cfg, buyList)],
+		accountAddress: address,
+	});
+	const ownerClient = await weightedClientFor({
+		publicClient,
+		chain: cfg.chain,
+		zerodevRpc: cfg.zerodevRpc,
+		config: await ownerConfig(passkey, cfg.rpID, hub, backup),
+		signer: await passkeyOwnerSigner(publicClient, passkey, cfg.rpID),
+		address,
+	});
+	const callData = await ownerClient.account.encodeCalls([{ to: address, value: 0n, data: innerData }]);
+	return sendWeighted([ownerClient], callData);
 }
 
 /** Floor POL the smart account needs for the §9 paymaster-less negatives' prefund check. */

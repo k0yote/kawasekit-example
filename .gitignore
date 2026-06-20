@@ -18,3 +18,7 @@ zerodev-passkey-jpyc/.passkey-cycle1.json
 zerodev-passkey-jpyc/.passkey-recovered.json
 zerodev-passkey-jpyc/.passkey-r2.json
 zerodev-passkey-jpyc/.passkey-recovery-probe.json
+zerodev-passkey-jpyc/.passkey-c1reval.json
+zerodev-passkey-jpyc/.passkey-recovery-chain.json
+zerodev-passkey-jpyc/.passkey-r4.json
+zerodev-passkey-jpyc/.passkey-r4c.json
