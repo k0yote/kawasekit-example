@@ -1,174 +1,113 @@
 /**
- * RFC-0003 Cycle 2 — R3a non-custodial recovery wiring (ZeroDev).
+ * RFC-0003 Cycle 2 (Approach B) — non-custodial recovery.
  *
- * The recoverable account = the Cycle-1 passkey-sudo account with a weighted guardian
- * validator (regular) + the recovery action installed. Recovery is a
- * `doRecovery(_validator, _data)` userOp signed by the GUARDIANS (not the passkey):
- * `_validator` = the passkey-validator module address, `_data` = the NEW passkey's
- * `getEnableData()` → the sudo rotates passkey→passkey. Guardians = {Hub, user backup},
- * weight 1 each, threshold 2 → neither alone can rotate (the non-custodial proof).
- *
- * UNAUDITED / Amoy / zero-value. The U1/U4 crux (recovery works with the passkey
- * provably disabled; the executor re-inits the passkey validator on-chain) is settled
- * empirically by `probe-recovery.ts` — see docs/rfc/0003-cycle2-recovery-plan.md.
+ * The owner is the weighted validator [passkey 100, Hub 50, backup 50, threshold 100].
+ * Recovery = the guardian quorum (Hub + backup = 100) RESETS the weighted config to a NEW
+ * passkey via `doRecovery(weightedValidatorAddress, newWeighted.getEnableData())`. The passkey
+ * is never used — the guardians act alone, and the account address is unchanged. Gate-proven
+ * on Amoy 2026-06-20 (see `probe-recovery.ts`).
  */
-import { getValidatorAddress as getPasskeyValidatorAddress, PasskeyValidatorContractVersion } from "@zerodev/passkey-validator";
-import { type CreateKernelAccountReturnType, createKernelAccount } from "@zerodev/sdk";
-import { getEntryPoint, KERNEL_V3_1 } from "@zerodev/sdk/constants";
-import { createWeightedECDSAValidator, getRecoveryAction } from "@zerodev/weighted-ecdsa-validator";
-import {
-	type Address,
-	type Chain,
-	encodeFunctionData,
-	type Hex,
-	type LocalAccount,
-	parseAbi,
-	type PublicClient,
-	type Transport,
-} from "viem";
-import { buildLostPasskeyValidator, buildPasskeyValidator } from "./account.ts";
+import { createWeightedValidator } from "@zerodev/weighted-validator";
+import { KERNEL_V3_1 } from "@zerodev/sdk/constants";
+import { type Address, type Chain, encodeFunctionData, type Hex, type LocalAccount, parseAbi, type PublicClient, type Transport } from "viem";
 import type { RfcConfig } from "./env.ts";
-import { buildSelfPaidKernelClient, buildSponsoredKernelClient } from "./harness.ts";
 import type { SoftwarePasskey } from "./passkey.ts";
+import {
+	entryPoint,
+	guardianSigner,
+	ownerConfig,
+	passkeyOwnerSigner,
+	sendWeighted,
+	WV,
+	weightedClientFor,
+	weightedValidatorAddress,
+} from "./weighted-account.ts";
 
-const entryPoint = getEntryPoint("0.7");
-
-/** The doRecovery executor (verbatim from ZeroDev's guardians/recovery.ts example). */
-const RECOVERY_EXECUTOR_FN = "function doRecovery(address _validator, bytes calldata _data)" as const;
-
-/** The ON-CHAIN weighted guardian set (who the guardians are + the threshold). */
-export interface GuardianSet {
-	readonly guardians: readonly { readonly address: Address; readonly weight: number }[];
-	readonly threshold: number;
-}
-
-/** The default R3a set: {Hub, user backup}, weight 1 each, threshold 2 (neither alone rotates). */
-export function twoOfTwoGuardians(hub: Address, userBackup: Address): GuardianSet {
-	return {
-		guardians: [
-			{ address: hub, weight: 1 },
-			{ address: userBackup, weight: 1 },
-		],
-		threshold: 2,
-	};
-}
+/** The recovery executor (verbatim from ZeroDev). Resets the sudo validator's config. */
+const RECOVERY_FN = "function doRecovery(address _validator, bytes calldata _data)" as const;
 
 /**
- * Build the weighted guardian validator. `set` is the ON-CHAIN weighted set (guardians +
- * threshold). `signers` is which LOCAL accounts actually sign NOW — pass enough weight to
- * meet the threshold for a valid recovery, or fewer for an under-threshold attempt (R2).
+ * The `doRecovery` callData that resets the weighted owner config to one with `newPasskey`
+ * as the primary signer (+ the same guardians). `_validator` = the weighted validator module;
+ * `_data` = the new config's `getEnableData()` blob. (`hub`/`backup` are LocalAccounts only to
+ * build the validator object — its `getEnableData` depends on the config, not the signer.)
  */
-export async function buildGuardianValidator(
-	publicClient: PublicClient<Transport, Chain>,
-	params: { readonly set: GuardianSet; readonly signers: readonly LocalAccount[] },
-) {
-	return createWeightedECDSAValidator(publicClient, {
-		entryPoint,
-		kernelVersion: KERNEL_V3_1,
-		config: { threshold: params.set.threshold, signers: [...params.set.guardians] },
-		signers: [...params.signers],
-	});
-}
-
-/**
- * The recoverable account: sudo = the passkey, regular = the guardian validator, action =
- * the recovery action. `signers` selects who co-signs a recovery userOp built from this
- * account. `lostPasskey` builds the sudo with a THROWING passkey signer (proves recovery
- * never uses the owner key) — address derivation is unaffected (public key only).
- */
-export async function createRecoverableAccount(params: {
-	readonly publicClient: PublicClient<Transport, Chain>;
-	readonly passkey: SoftwarePasskey;
-	readonly rpID: string;
-	readonly set: GuardianSet;
-	readonly signers: readonly LocalAccount[];
-	readonly lostPasskey?: boolean;
-}): Promise<CreateKernelAccountReturnType<"0.7">> {
-	const sudo = params.lostPasskey
-		? await buildLostPasskeyValidator(params.publicClient, params.passkey, params.rpID)
-		: await buildPasskeyValidator(params.publicClient, params.passkey, params.rpID);
-	const guardian = await buildGuardianValidator(params.publicClient, {
-		set: params.set,
-		signers: params.signers,
-	});
-	return createKernelAccount(params.publicClient, {
-		entryPoint,
-		kernelVersion: KERNEL_V3_1,
-		plugins: { sudo, regular: guardian, action: getRecoveryAction(entryPoint.version) },
-	});
-}
-
-/** Build the doRecovery callData that rotates the sudo to a NEW passkey. */
-export async function buildDoRecoveryCallData(
+export async function recoveryCallData(
 	publicClient: PublicClient<Transport, Chain>,
 	newPasskey: SoftwarePasskey,
+	hub: LocalAccount,
+	backup: LocalAccount,
 	rpID: string,
 ): Promise<Hex> {
-	const passkeyValidatorAddress = getPasskeyValidatorAddress(
+	const newConfig = await ownerConfig(newPasskey, rpID, hub.address, backup.address);
+	const newWeighted = await createWeightedValidator(publicClient, {
 		entryPoint,
-		KERNEL_V3_1,
-		PasskeyValidatorContractVersion.V0_0_3_PATCHED,
-	);
-	const newValidator = await buildPasskeyValidator(publicClient, newPasskey, rpID);
-	const newEnableData = await newValidator.getEnableData();
+		kernelVersion: KERNEL_V3_1,
+		validatorContractVersion: WV,
+		signer: await guardianSigner(hub),
+		config: newConfig,
+	});
 	return encodeFunctionData({
-		abi: parseAbi([RECOVERY_EXECUTOR_FN]),
+		abi: parseAbi([RECOVERY_FN]),
 		functionName: "doRecovery",
-		args: [passkeyValidatorAddress, newEnableData],
+		args: [weightedValidatorAddress, await newWeighted.getEnableData()],
 	});
 }
 
 /**
- * Send the doRecovery userOp from the recoverable account, signed by `signers`. Pass both
- * guardians for a valid 2-of-2 (R3); pass one for an under-threshold attempt (R2).
- * `lostPasskey` builds the sudo with a throwing passkey (proves the recovery never uses
- * the owner key). `selfPaid` runs paymaster-LESS (R2's on-chain boundary, RFC §9);
- * default = sponsored (R1/R3, the Cycle-1 pattern, no account POL).
+ * Guardian-quorum (Hub + backup = 100) config-reset of the weighted owner to a NEW passkey.
+ * `currentPasskey` fixes the on-chain config the guardians validate against; `newPasskey` is
+ * the recovery target. Pass ONLY `hub` as the signer subset (via the harness) for R2's
+ * under-threshold negative. `selfPaid` runs paymaster-less (R2's on-chain boundary).
  */
 export async function recoverOwner(params: {
 	readonly publicClient: PublicClient<Transport, Chain>;
 	readonly cfg: RfcConfig;
-	readonly passkey: SoftwarePasskey;
-	readonly set: GuardianSet;
-	readonly signers: readonly LocalAccount[];
+	readonly currentPasskey: SoftwarePasskey;
 	readonly newPasskey: SoftwarePasskey;
-	readonly lostPasskey?: boolean;
+	readonly hub: LocalAccount;
+	readonly backup: LocalAccount;
+	readonly address?: Address;
 	readonly selfPaid?: boolean;
 }): Promise<{ readonly transactionHash: Hex | null }> {
-	const account = await createRecoverableAccount({
-		publicClient: params.publicClient,
-		passkey: params.passkey,
-		rpID: params.cfg.rpID,
-		set: params.set,
-		signers: params.signers,
-		lostPasskey: params.lostPasskey,
-	});
-	const client = params.selfPaid
-		? buildSelfPaidKernelClient({ account, cfg: params.cfg })
-		: buildSponsoredKernelClient({ account, cfg: params.cfg });
-	const callData = await buildDoRecoveryCallData(params.publicClient, params.newPasskey, params.cfg.rpID);
-	const hash = await client.sendUserOperation({ callData });
-	const receipt = await client.waitForUserOperationReceipt({ hash });
-	return { transactionHash: receipt.receipt.transactionHash };
+	const { publicClient, cfg, currentPasskey, newPasskey, hub, backup } = params;
+	const currentConfig = await ownerConfig(currentPasskey, cfg.rpID, hub.address, backup.address);
+	const callData = await recoveryCallData(publicClient, newPasskey, hub, backup, cfg.rpID);
+	const sponsored = params.selfPaid !== true;
+	const base = {
+		publicClient,
+		chain: cfg.chain,
+		zerodevRpc: cfg.zerodevRpc,
+		config: currentConfig,
+		sponsored,
+		...(params.address !== undefined ? { address: params.address } : {}),
+	};
+	const hubClient = await weightedClientFor({ ...base, signer: await guardianSigner(hub) });
+	const backupClient = await weightedClientFor({ ...base, signer: await guardianSigner(backup) });
+	return sendWeighted([hubClient, backupClient], callData);
 }
 
 /**
- * Build a kernel account at the EXISTING recovered address, owned by the NEW passkey
- * (sudo-only; no regular plugin). Used to transact / revoke as the new owner — the
- * address is fixed at deploy (`address = f(sudo)` in Kernel v3.1), so the recovered
- * account keeps its address while its root validator now verifies the new passkey.
+ * A weighted-kernel client at the (recovered) account address, controlled by the NEW passkey
+ * owner — to prove the new owner can act (R3) and to issue session keys under the new owner
+ * (R4b). The passkey alone (weight 100) meets the threshold, so it signs solo.
  */
 export async function bindNewOwnerAccount(params: {
 	readonly publicClient: PublicClient<Transport, Chain>;
+	readonly cfg: RfcConfig;
 	readonly newPasskey: SoftwarePasskey;
-	readonly rpID: string;
+	readonly hub: Address;
+	readonly backup: Address;
 	readonly address: Address;
-}): Promise<CreateKernelAccountReturnType<"0.7">> {
-	const sudo = await buildPasskeyValidator(params.publicClient, params.newPasskey, params.rpID);
-	return createKernelAccount(params.publicClient, {
-		entryPoint,
-		kernelVersion: KERNEL_V3_1,
+	readonly sponsored?: boolean;
+}) {
+	return weightedClientFor({
+		publicClient: params.publicClient,
+		chain: params.cfg.chain,
+		zerodevRpc: params.cfg.zerodevRpc,
+		config: await ownerConfig(params.newPasskey, params.cfg.rpID, params.hub, params.backup),
+		signer: await passkeyOwnerSigner(params.publicClient, params.newPasskey, params.cfg.rpID),
 		address: params.address,
-		plugins: { sudo },
+		...(params.sponsored !== undefined ? { sponsored: params.sponsored } : {}),
 	});
 }
