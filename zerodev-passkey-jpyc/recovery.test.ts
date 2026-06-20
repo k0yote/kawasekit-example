@@ -13,7 +13,7 @@
  */
 import "dotenv/config";
 
-import { createBuyListPolicies, jpycAbi, polygonAmoy, type TransferJpycResult } from "kawasekit";
+import { buildRevokeSessionKeyCall, createBuyListPolicies, jpycAbi, polygonAmoy, type TransferJpycResult } from "kawasekit";
 import { type Address, createPublicClient, formatUnits, http, parseUnits } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { beforeAll, describe, expect, it } from "vitest";
@@ -30,7 +30,6 @@ import {
 	buildBuyList,
 	issueSessionKeyUnderWeightedSudo,
 	revokeSessionKeyUnderWeightedSudo,
-	uninstallSessionKeyData,
 } from "./harness.ts";
 import { createSoftwarePasskey, type SoftwarePasskey } from "./passkey.ts";
 import { bindNewOwnerAccount, recoverOwner, recoveryCallData } from "./recovery.ts";
@@ -58,7 +57,7 @@ describe("RFC-0003 Cycle 2 (Approach B) unit — recovery callData (no chain)", 
 		expect(callData.length).toBeGreaterThan(400); // _data = weighted config blob (3 signers)
 	});
 
-	it("uninstallSessionKeyData encodes uninstallValidation(bytes21, bytes, bytes) for the session key", async () => {
+	it("SDK buildRevokeSessionKeyCall encodes uninstallValidation(bytes21, bytes, bytes) for the session key", async () => {
 		const publicClient = createPublicClient({ chain: polygonAmoy, transport: http() });
 		const sessionSigner = privateKeyToAccount(generatePrivateKey());
 		const policies = createBuyListPolicies({
@@ -68,11 +67,12 @@ describe("RFC-0003 Cycle 2 (Approach B) unit — recovery callData (no chain)", 
 			maxTransfers: 1,
 			validUntil: 4_000_000_000,
 		});
-		const data = await uninstallSessionKeyData({
+		// kawasekit 0.9.0 (U-B2): the example now consumes the SDK's revoke builder.
+		const data = await buildRevokeSessionKeyCall({
 			publicClient,
-			sessionSigner,
+			sessionKeySigner: sessionSigner,
 			policies: [...policies],
-			accountAddress: "0x000000000000000000000000000000000000bEEF",
+			smartAccountAddress: "0x000000000000000000000000000000000000bEEF",
 		});
 		expect(data.slice(0, 10)).toBe("0xe6f3d50a"); // uninstallValidation(bytes21,bytes,bytes)
 	});

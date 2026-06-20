@@ -12,15 +12,17 @@
  * passkey-capable kawasekit issuance helper is the Cycle-1 follow-up.
  */
 
-import { type Policy, serializePermissionAccount, toPermissionValidator } from "@zerodev/permissions";
+import { serializePermissionAccount, toPermissionValidator } from "@zerodev/permissions";
 import { toECDSASigner } from "@zerodev/permissions/signers";
 import { type CreateKernelAccountReturnType, createKernelAccount, createKernelAccountClient } from "@zerodev/sdk";
-import { getEntryPoint, KERNEL_V3_1, VALIDATOR_TYPE } from "@zerodev/sdk/constants";
+import { getEntryPoint, KERNEL_V3_1 } from "@zerodev/sdk/constants";
 import {
+	buildRevokeSessionKeyCall,
 	type ConfiguredKernelClient,
 	createBuyListPolicies,
 	createSponsoredKernelClient,
 	deriveIdempotencyKey,
+	issueSessionKey,
 	jpycAbi,
 	KAWASEKIT_SESSION_ENVELOPE_VERSION,
 	parseSessionEnvelope,
@@ -32,14 +34,10 @@ import {
 import {
 	type Address,
 	type Chain,
-	concatHex,
-	encodeFunctionData,
 	formatUnits,
 	type Hex,
 	http,
 	type LocalAccount,
-	pad,
-	parseAbi,
 	parseUnits,
 	type PublicClient,
 	type Transport,
@@ -169,75 +167,21 @@ export async function issueSessionKeyUnderWeightedSudo(params: {
 	readonly address?: Address;
 }): Promise<string> {
 	const { cfg, publicClient, passkey, hub, backup, sessionSigner, buyList } = params;
-	const entryPoint = getEntryPoint("0.7");
-	const policies = buyListPolicies(cfg, buyList);
 	const sudoValidator = await buildOwnerSudoValidator(publicClient, passkey, cfg.rpID, hub, backup);
-	const sessionModularSigner = await toECDSASigner({ signer: sessionSigner });
-	const permissionValidator = await toPermissionValidator(publicClient, {
-		signer: sessionModularSigner,
-		policies: [...policies],
-		entryPoint,
-		kernelVersion: KERNEL_V3_1,
-	});
-	// Under a WEIGHTED sudo, the enable signature must be the weighted approval (approvePlugin +
-	// encodeSignatures) — the default single-signer enable fails on-chain (EnableNotApproved).
-	const enableSignature = await approveSessionKeyEnable(publicClient, cfg, passkey, hub, backup, permissionValidator, params.address);
-	const account = await createKernelAccount(publicClient, {
-		plugins: { sudo: sudoValidator, regular: permissionValidator },
-		entryPoint,
-		kernelVersion: KERNEL_V3_1,
+	// kawasekit 0.9.0 (U-B1): issue under the weighted sudo by injecting the pre-built
+	// sudoValidator + the weighted enable via `approveEnable` (which approves the SDK-built
+	// permission validator with `approvePlugin` + `encodeSignatures`). The default single-
+	// signer enable fails on-chain (EnableNotApproved); the SDK threads our enable instead.
+	const envelope = await issueSessionKey({
+		publicClient,
+		sudoValidator,
+		sessionKeySigner: sessionSigner,
+		policies: [...buyListPolicies(cfg, buyList)],
 		...(params.address !== undefined ? { address: params.address } : {}),
-	});
-	const serialized = await serializePermissionAccount(account, undefined, enableSignature);
-	return serializeSessionEnvelope({
-		kawasekitVersion: KAWASEKIT_SESSION_ENVELOPE_VERSION,
-		chainId: AMOY_CHAIN_ID,
-		smartAccountAddress: account.address,
-		sessionKeyAddress: sessionSigner.address,
-		serialized,
+		approveEnable: (plugin) => approveSessionKeyEnable(publicClient, cfg, passkey, hub, backup, plugin, params.address),
 		expiresAt: BigInt(buyList.validUntil),
 	});
-}
-
-/** `uninstallValidation` on the Kernel v3.1 account — removes a validation (session key). */
-const UNINSTALL_VALIDATION_ABI = parseAbi([
-	"function uninstallValidation(bytes21 vId, bytes deinitData, bytes hookDeinitData)",
-]);
-
-/**
- * The inner `uninstallValidation(vId, deinitData, hookData)` call that removes a session-key
- * permission validator. A byte-faithful reproduction of `@zerodev/sdk`'s `uninstallPlugin`
- * action (`node_modules/@zerodev/sdk/_esm/actions/account-client/uninstallPlugin.js`): we
- * cannot call `uninstallPlugin(client, …)` directly because it hardcodes the single-signer
- * `sendUserOperation` path the WEIGHTED validator rejects (it needs the approve/aggregate
- * `sendWeighted` flow). The plugin is rebuilt from the SAME session signer + SAME policies
- * installed at issue time, so `getIdentifier()` + `getEnableData()` reproduce the on-chain
- * validation id exactly (a mismatch would revert at `uninstallValidation`).
- */
-export async function uninstallSessionKeyData(params: {
-	readonly publicClient: PublicClient<Transport, Chain>;
-	readonly sessionSigner: LocalAccount;
-	/** The SAME policy set installed at issue (rebuild via `buyListPolicies` / `createBuyListPolicies`). */
-	readonly policies: readonly Policy[];
-	readonly accountAddress: Address;
-}): Promise<Hex> {
-	const { publicClient, sessionSigner } = params;
-	const entryPoint = getEntryPoint("0.7");
-	const sessionModularSigner = await toECDSASigner({ signer: sessionSigner });
-	const plugin = await toPermissionValidator(publicClient, {
-		signer: sessionModularSigner,
-		policies: [...params.policies],
-		entryPoint,
-		kernelVersion: KERNEL_V3_1,
-	});
-	// validatorId = VALIDATOR_TYPE.PERMISSION ‖ getIdentifier() right-padded to 20 bytes (= bytes21).
-	const validatorId = concatHex([VALIDATOR_TYPE.PERMISSION, pad(plugin.getIdentifier(), { size: 20, dir: "right" })]);
-	const deinitData = await plugin.getEnableData(params.accountAddress);
-	return encodeFunctionData({
-		abi: UNINSTALL_VALIDATION_ABI,
-		functionName: "uninstallValidation",
-		args: [validatorId, deinitData, "0x"],
-	});
+	return serializeSessionEnvelope(envelope);
 }
 
 /**
@@ -259,11 +203,13 @@ export async function revokeSessionKeyUnderWeightedSudo(params: {
 	readonly address: Address;
 }): Promise<{ readonly transactionHash: Hex | null }> {
 	const { cfg, publicClient, passkey, hub, backup, sessionSigner, buyList, address } = params;
-	const innerData = await uninstallSessionKeyData({
+	// kawasekit 0.9.0 (U-B2): the SDK builds the uninstallValidation callData; we submit it
+	// via the weighted aggregate flow (sendWeighted) since the owner is a weighted sudo.
+	const innerData = await buildRevokeSessionKeyCall({
 		publicClient,
-		sessionSigner,
+		sessionKeySigner: sessionSigner,
 		policies: [...buyListPolicies(cfg, buyList)],
-		accountAddress: address,
+		smartAccountAddress: address,
 	});
 	const ownerClient = await weightedClientFor({
 		publicClient,
